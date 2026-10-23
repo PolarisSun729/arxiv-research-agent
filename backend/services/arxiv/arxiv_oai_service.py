@@ -15,7 +15,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import requests
 
@@ -1168,28 +1168,71 @@ class ArxivOaiDatabaseService:
                     (normalized_arxiv_id,),
                 )
                 row = cursor.fetchone()
-                if not row:
-                    return None
-                # 读取时把 authors/categories 还原成更自然的结构，减少上层分支判断。
-                return {
-                    "arxiv_id": row[0],
-                    "title": row[1],
-                    "abstract": row[2],
-                    "authors": self._parse_list_field(row[3]),
-                    "categories": self._parse_list_field(row[4]),
-                    "primary_category": row[5],
-                    "created": row[6],
-                    "updated": row[7],
-                    "abs_url": row[8],
-                    "pdf_url": row[9],
-                    "oai_datestamp": row[10],
-                    "fetched_at": row[11],
-                    "created_at": row[12],
-                    "updated_at": row[13],
-                }
+                return self._paper_row_to_dict(row) if row else None
         except Exception as exc:
             logger.error("Error getting OAI paper %s: %s", normalized_arxiv_id, exc)
             return None
+
+    def iter_papers_newest_first(self, *, since: Optional[str] = None, page_size: int = 500) -> Iterator[List[Dict[str, Any]]]:
+        """按入库顺序从新到旧分页读取论文，供补向量等全库扫描任务使用。
+
+        用自增主键做 keyset 翻页，不依赖 OFFSET，也不需要 oai_datestamp 索引；
+        since（YYYY-MM-DD）只保留 oai_datestamp 不早于它的论文。读取失败直接抛出。
+        """
+        last_id: Optional[int] = None
+        while True:
+            conditions: List[str] = []
+            params: List[Any] = []
+            if last_id is not None:
+                conditions.append("id < ?")
+                params.append(last_id)
+            if since:
+                conditions.append("oai_datestamp >= ?")
+                params.append(since)
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+            with self._get_connection() as conn:
+                rows = conn.execute(
+                    f"SELECT id, {self._PAPER_COLUMNS} FROM arxiv_oai_papers {where_clause} ORDER BY id DESC LIMIT ?",
+                    (*params, max(1, int(page_size))),
+                ).fetchall()
+            if not rows:
+                return
+            last_id = int(rows[-1][0])
+            yield [self._paper_row_to_dict(row[1:]) for row in rows]
+
+    def count_papers_since(self, since: Optional[str] = None) -> int:
+        """统计 oai_datestamp 不早于 since 的论文数；since 为空时统计全部。读取失败直接抛出。"""
+        with self._get_connection() as conn:
+            if since:
+                row = conn.execute("SELECT COUNT(*) FROM arxiv_oai_papers WHERE oai_datestamp >= ?", (since,)).fetchone()
+            else:
+                row = conn.execute("SELECT COUNT(*) FROM arxiv_oai_papers").fetchone()
+        return int(row[0] or 0) if row else 0
+
+    _PAPER_COLUMNS = (
+        "arxiv_id, title, abstract, authors, categories, primary_category, created, updated, "
+        "abs_url, pdf_url, oai_datestamp, fetched_at, created_at, updated_at"
+    )
+
+    def _paper_row_to_dict(self, row: Sequence[Any]) -> Dict[str, Any]:
+        """把按 _PAPER_COLUMNS 顺序查出的一行转成论文 dict。"""
+        # 读取时把 authors/categories 还原成更自然的结构，减少上层分支判断。
+        return {
+            "arxiv_id": row[0],
+            "title": row[1],
+            "abstract": row[2],
+            "authors": self._parse_list_field(row[3]),
+            "categories": self._parse_list_field(row[4]),
+            "primary_category": row[5],
+            "created": row[6],
+            "updated": row[7],
+            "abs_url": row[8],
+            "pdf_url": row[9],
+            "oai_datestamp": row[10],
+            "fetched_at": row[11],
+            "created_at": row[12],
+            "updated_at": row[13],
+        }
 
     def get_recent_papers(
         self,
@@ -2006,6 +2049,31 @@ class ArxivOaiDatabaseService:
             return 0
 
 
+def create_oai_embedding_handler(
+    embedding_service: Optional["EmbeddingService"] = None,
+    vector_store_service: Optional["VectorStoreService"] = None,
+    embedding_collection_name: str = "arxiv_paper_embeddings",
+) -> ArxivEmbeddingHandler:
+    """按 OAI 配置创建论文向量处理器，同步服务和补向量脚本共用。"""
+    # 首页统计、普通本地检索只依赖 OAI SQLite；只有真的要做向量化时才导入 Milvus 相关依赖。
+    if embedding_service is None:
+        from services.embedding.embedding_service import EmbeddingService
+
+        embedding_service = EmbeddingService()
+    if vector_store_service is None:
+        from services.storage.vector_store_service import VectorStoreService
+
+        vector_store_service = VectorStoreService()
+    return ArxivEmbeddingHandler(
+        embedding_service=embedding_service,
+        vector_store_service=vector_store_service,
+        embedding_collection_name=embedding_collection_name,
+        embedding_batch_size=OAI_EMBEDDING_BATCH_SIZE,
+        vector_query_batch_size=OAI_VECTOR_QUERY_BATCH_SIZE,
+        token_price_per_1k=OAI_DASHSCOPE_TEXT_TOKEN_PRICE_PER_1K,
+    )
+
+
 class ArxivOaiSyncService:
     def __init__(
         self,
@@ -2018,11 +2086,13 @@ class ArxivOaiSyncService:
         vector_store_service: Optional["VectorStoreService"] = None,
         embedding_collection_name: str = "arxiv_paper_embeddings",
         user_agent: str = "rag-project01-framework-oai-sync/1.0",
+        with_embeddings: bool = False,
     ):
         """初始化 OAI-PMH 同步服务及其依赖。
 
         该服务负责远端拉取、分页续传、分类过滤、落库和 embedding 写入，因此会在
         构造期统一准备网络会话、限流参数和向量化依赖。
+        with_embeddings 为 True（或注入了 embedding / 向量库服务）时，落库成功的论文会同时写入论文向量。
         """
         self.endpoint = endpoint
         # arXiv OAI-PMH 对抓取频率较敏感，这里强制下限避免调用方误设过小间隔。
@@ -2035,23 +2105,11 @@ class ArxivOaiSyncService:
         self.xml_parser = ArxivOaiXmlParser()
         # 初始化 embedding 处理器
         self.embedding_handler = None
-        if embedding_service or vector_store_service:
-            # 首页统计、普通本地检索只依赖 OAI SQLite；只有真的要做同步向量化时才导入 Milvus 相关依赖。
-            if embedding_service is None:
-                from services.embedding.embedding_service import EmbeddingService
-
-                embedding_service = EmbeddingService()
-            if vector_store_service is None:
-                from services.storage.vector_store_service import VectorStoreService
-
-                vector_store_service = VectorStoreService()
-            self.embedding_handler = ArxivEmbeddingHandler(
+        if with_embeddings or embedding_service or vector_store_service:
+            self.embedding_handler = create_oai_embedding_handler(
                 embedding_service=embedding_service,
                 vector_store_service=vector_store_service,
                 embedding_collection_name=embedding_collection_name,
-                embedding_batch_size=OAI_EMBEDDING_BATCH_SIZE,
-                vector_query_batch_size=OAI_VECTOR_QUERY_BATCH_SIZE,
-                token_price_per_1k=OAI_DASHSCOPE_TEXT_TOKEN_PRICE_PER_1K,
             )
         # 复用 Session，统一携带 User-Agent 并减少多页抓取的连接开销。
         self.session = requests.Session()

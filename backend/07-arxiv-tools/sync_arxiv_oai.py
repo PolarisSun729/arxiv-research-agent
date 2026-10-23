@@ -4,6 +4,12 @@
     把 [起点, 截止日] 拆成逐天的 ListRecords 请求，按目标分类过滤后 upsert 到本地 OAI 库
     （默认 backend/06-database/arxiv_oai.db 的 arxiv_oai_papers 表），写库时同步更新 FTS5 和分类索引。
     只有 ARXIV_DATA_SOURCE=local 时后端才会读这个库。编排逻辑在 services/arxiv/oai_incremental_sync.py。
+    落库成功的论文会同时用当前 embedding 配置生成论文向量，写入 Milvus 的 arxiv_paper_embeddings，
+    推荐的兴趣簇召回只在这个 collection 里找论文。--dry-run / --count-only 不生成向量。
+
+向量失败:
+    embedding 或向量库出错只计入摘要里的 embedding_errors，不算当天失败，游标照常推进；
+    漏掉的论文用 backfill_arxiv_oai_embeddings.py 补齐（它会跳过已有向量的论文，重复运行也安全）。
 
 断点续传:
     游标默认是 backend/data/arxiv-oai-sync/sync_arxiv_oai_since_last_run.state（--state-file 可改）。
@@ -32,6 +38,7 @@
                                  论文只要挂了其中任一分类（包括 cross-list）就会保留
     OAI_SQLITE_DATABASE_PATH     OAI 库路径，默认 backend/06-database/arxiv_oai.db
     HTTP_PROXY / HTTPS_PROXY     requests 会自动读取，国内网络访问 arXiv 时需要设置
+    ARXIV_OAI_EMBEDDING_BATCH_SIZE  每次 embedding 请求的文本条数，默认 20
 
 退出码:
     0 = 全部日期成功（含没有新的完整日期可同步）；1 = 某一天同步失败，或另一个同步正在运行；
@@ -121,6 +128,8 @@ def main() -> int:
         request_interval_seconds=args.interval,
         request_timeout_seconds=args.timeout,
         max_retries=args.max_retries,
+        # 正式同步时一并写论文向量，推荐的兴趣簇召回才能看到新论文；演练和只计数不写库，也就不连向量库、不花钱。
+        with_embeddings=not (args.dry_run or args.count_only),
     )
     options = IncrementalSyncOptions(
         from_date=args.from_date,

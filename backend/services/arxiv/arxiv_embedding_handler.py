@@ -4,9 +4,10 @@
 支持批量和单篇两种处理模式，提供成本统计和错误处理。
 """
 
+import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,9 @@ class ArxivEmbeddingHandler:
     ) -> EmbeddingStats:
         """批量为已落库论文生成 embedding，并写入向量库。
 
+        已有向量的论文直接跳过，所以重复调用是幂等的；失败的论文只计入 embedding_errors，
+        不抛异常，由补向量脚本（07-arxiv-tools/backfill_arxiv_oai_embeddings.py）重跑补齐。
+
         参数:
             papers: 论文列表
             stats: 可选的统计对象，用于累计统计信息
@@ -71,46 +75,18 @@ class ArxivEmbeddingHandler:
         if stats is None:
             stats = EmbeddingStats()
 
-        eligible_papers = []
-        eligible_ids = []
-        for paper in papers:
-            arxiv_id = str(paper.get("arxiv_id", "") or "").strip()
-            title = str(paper.get("title", "") or "").strip()
-            abstract = str(paper.get("abstract", "") or "").strip()
-            if not arxiv_id or not title or not abstract:
-                # 没有标题或摘要时 embedding 质量不可控，直接跳过比写入噪声向量更安全。
-                logger.debug(
-                    "Skipping embedding for OAI paper %s because title or abstract is missing",
-                    arxiv_id or "<unknown>",
-                )
-                continue
-            eligible_papers.append(paper)
-            eligible_ids.append(arxiv_id)
-
+        eligible_papers = self._eligible_papers(papers)
         if not eligible_papers:
             return stats
 
-        existing_ids = set()
         try:
-            for start in range(0, len(eligible_ids), self.vector_query_batch_size):
-                batch_ids = eligible_ids[start : start + self.vector_query_batch_size]
-                # 先批量探测已存在向量，避免重复生成 embedding 造成额外成本。
-                existing_embeddings = self.vector_store_service.get_paper_embeddings_by_arxiv_ids(
-                    collection_name=self.embedding_collection_name,
-                    arxiv_ids=batch_ids,
-                )
-                for item in existing_embeddings:
-                    arxiv_id = str(item.get("arxiv_id", "") or "").strip()
-                    if arxiv_id:
-                        existing_ids.add(arxiv_id)
+            missing_papers = self._exclude_embedded_papers(eligible_papers)
         except Exception as exc:  # pragma: no cover - vector store runtime dependent
-            logger.warning("Failed to inspect existing embeddings for OAI papers: %s", exc)
-        if existing_ids:
-            stats.embeddings_skipped_existing += len(existing_ids)
-
-        missing_papers = [
-            paper for paper in eligible_papers if str(paper.get("arxiv_id", "") or "").strip() not in existing_ids
-        ]
+            # 向量库不可用时整批放弃：查不到已有向量就去生成，写库又必然失败，只会白花 embedding 费用。
+            stats.embedding_errors += len(eligible_papers)
+            logger.warning("Failed to inspect existing embeddings for %s OAI papers, skipping batch: %s", len(eligible_papers), exc)
+            return stats
+        stats.embeddings_skipped_existing += len(eligible_papers) - len(missing_papers)
         if not missing_papers:
             return stats
 
@@ -139,57 +115,74 @@ class ArxivEmbeddingHandler:
                 raise ValueError(
                     f"Embedding batch returned {len(embeddings)} vectors for {len(missing_papers)} papers"
                 )
-
-            items = [
-                {
-                    "embedding": embedding,
-                    "metadata": self._build_embedding_metadata(paper),
-                }
-                for paper, embedding in zip(missing_papers, embeddings)
-                if embedding
-            ]
-            if not items:
-                return stats
-
-            inserted_count = self.vector_store_service.insert_embeddings(self.embedding_collection_name, items)
-            stats.embeddings_written += int(inserted_count)
-            # 批量写入后逐条记日志，便于后续按 arxiv_id 追踪 embedding 生命周期。
-            for paper in missing_papers:
-                logger.info("Embedded OAI paper into vector store: %s", paper.get("arxiv_id"))
-        except Exception as exc:  # pragma: no cover - vector store/runtime dependent
+        except Exception as exc:  # pragma: no cover - embedding runtime dependent
             logger.warning("Batch embedding for OAI papers failed, falling back to single-item processing: %s", exc)
-            for paper in missing_papers:
-                self._store_single_paper_embedding(paper, stats)
+            for paper, text in zip(missing_papers, texts):
+                self._store_single_paper_embedding(paper, text, stats)
+            return stats
 
-        return stats
-
-    def _store_single_paper_embedding(self, paper: Dict[str, Any], stats: EmbeddingStats) -> None:
-        """为单篇论文生成并写入 embedding，作为批量失败时的兜底路径。"""
-        arxiv_id = str(paper.get("arxiv_id", "") or "").strip()
-        title = str(paper.get("title", "") or "").strip()
-        abstract = str(paper.get("abstract", "") or "").strip()
-        if not arxiv_id or not title or not abstract:
-            logger.debug(
-                "Skipping embedding for OAI paper %s because title or abstract is missing", arxiv_id or "<unknown>"
-            )
-            return
+        items = []
+        for paper, embedding in zip(missing_papers, embeddings):
+            if embedding:
+                items.append({"embedding": embedding, "metadata": self._build_embedding_metadata(paper)})
+            else:
+                stats.embedding_errors += 1
+                logger.warning("Embedding service returned an empty vector for OAI paper %s", paper.get("arxiv_id"))
+        if not items:
+            return stats
 
         try:
-            # 单篇兜底前先检查是否已有向量，避免批量失败后重复写入。
+            inserted_count = self.vector_store_service.insert_embeddings(self.embedding_collection_name, items)
+        except Exception as exc:  # pragma: no cover - vector store runtime dependent
+            # 向量已经算好，写库失败时不再逐篇重算，免得同一批付两次钱；漏掉的论文由补向量脚本补上。
+            stats.embedding_errors += len(items)
+            logger.warning("Failed to insert %s OAI paper embeddings into vector store: %s", len(items), exc)
+            return stats
+        stats.embeddings_written += int(inserted_count)
+        for item in items:
+            logger.debug("Embedded OAI paper into vector store: %s", item["metadata"]["arxiv_id"])
+        return stats
+
+    def find_papers_missing_embeddings(self, papers: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """返回有标题和摘要、但向量库里还没有向量的论文；向量库查询失败时直接抛出。"""
+        return self._exclude_embedded_papers(self._eligible_papers(papers))
+
+    @staticmethod
+    def _eligible_papers(papers: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """过滤掉缺 arxiv_id、标题或摘要的论文。"""
+        eligible_papers = []
+        for paper in papers:
+            arxiv_id = str(paper.get("arxiv_id", "") or "").strip()
+            title = str(paper.get("title", "") or "").strip()
+            abstract = str(paper.get("abstract", "") or "").strip()
+            if not arxiv_id or not title or not abstract:
+                # 没有标题或摘要时 embedding 质量不可控，直接跳过比写入噪声向量更安全。
+                logger.debug(
+                    "Skipping embedding for OAI paper %s because title or abstract is missing",
+                    arxiv_id or "<unknown>",
+                )
+                continue
+            eligible_papers.append(paper)
+        return eligible_papers
+
+    def _exclude_embedded_papers(self, papers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """分批探测向量库，去掉已有向量的论文，避免重复生成 embedding 造成额外成本。"""
+        ids = [str(paper.get("arxiv_id", "") or "").strip() for paper in papers]
+        existing_ids = set()
+        for start in range(0, len(ids), self.vector_query_batch_size):
             existing_embeddings = self.vector_store_service.get_paper_embeddings_by_arxiv_ids(
                 collection_name=self.embedding_collection_name,
-                arxiv_ids=[arxiv_id],
+                arxiv_ids=ids[start : start + self.vector_query_batch_size],
             )
-        except Exception as exc:  # pragma: no cover - vector store runtime dependent
-            logger.warning("Failed to inspect existing embedding for OAI paper %s: %s", arxiv_id, exc)
-            existing_embeddings = []
+            for item in existing_embeddings:
+                arxiv_id = str(item.get("arxiv_id", "") or "").strip()
+                if arxiv_id:
+                    existing_ids.add(arxiv_id)
+        return [paper for paper, arxiv_id in zip(papers, ids) if arxiv_id not in existing_ids]
 
-        if existing_embeddings:
-            stats.embeddings_skipped_existing += 1
-            return
-
-        stats.embeddings_attempted += 1
-        text_to_embed = self.embedding_service.build_paper_embedding_text(title, abstract)
+    def _store_single_paper_embedding(self, paper: Dict[str, Any], text_to_embed: str, stats: EmbeddingStats) -> None:
+        """为单篇论文生成并写入 embedding，作为批量 embedding 失败时的兜底路径。"""
+        arxiv_id = str(paper.get("arxiv_id", "") or "").strip()
         if not text_to_embed:
             stats.embedding_errors += 1
             logger.warning("Skipping OAI embedding for %s because embedding text is empty", arxiv_id)
@@ -213,7 +206,7 @@ class ArxivEmbeddingHandler:
                 metadata,
             )
             stats.embeddings_written += 1
-            logger.info("Embedded OAI paper into vector store: %s", arxiv_id)
+            logger.debug("Embedded OAI paper into vector store: %s", arxiv_id)
         except Exception as exc:  # pragma: no cover - embedding/vector store runtime dependent
             stats.embedding_errors += 1
             logger.warning("Failed to embed OAI paper %s into vector store: %s", arxiv_id, exc)
@@ -225,14 +218,32 @@ class ArxivEmbeddingHandler:
             "content": str(paper.get("abstract", "") or "").strip(),
             "arxiv_id": str(paper.get("arxiv_id", "") or "").strip(),
             "title": str(paper.get("title", "") or "").strip(),
-            "authors": paper.get("authors", ""),
-            "categories": paper.get("categories", ""),
+            "authors": self._join_list_field(paper.get("authors", "")),
+            "categories": self._join_list_field(paper.get("categories", "")),
             "published_date": str(
                 paper.get("created") or paper.get("updated") or paper.get("oai_datestamp") or ""
             ).strip(),
             "url": str(paper.get("abs_url") or paper.get("pdf_url") or "").strip(),
             "embedding_model": self.embedding_config.model_name,
         }
+
+    @staticmethod
+    def _join_list_field(value: Any) -> str:
+        """把作者、分类统一成逗号分隔字符串，和推荐侧物化论文时写入向量库的格式一致。
+
+        OAI 库里这两个字段存的是 JSON 数组字符串，直接 str() 会把方括号和引号写进向量库。
+        """
+        if isinstance(value, str):
+            text = value.strip()
+            if not text.startswith("["):
+                return text
+            try:
+                value = json.loads(text)
+            except ValueError:
+                return text
+        if isinstance(value, (list, tuple)):
+            return ", ".join(str(item).strip() for item in value if str(item).strip())
+        return str(value or "").strip()
 
     def _accumulate_embedding_usage(self, stats: EmbeddingStats, usage: Dict[str, Any], item_count: int) -> None:
         """把 embedding 调用的 token 用量和估算成本累计到统计中。"""
