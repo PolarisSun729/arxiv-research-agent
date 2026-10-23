@@ -8,7 +8,7 @@
       3. 换了 embedding 模型或清空了 collection。
 
 运行行为:
-    - 只扫描首次提交日期在保留窗口内的论文（ARXIV_OAI_EMBEDDING_RETENTION_MONTHS，默认 4 个月，
+    - 只扫描首次提交日期在保留窗口内的论文（ARXIV_OAI_EMBEDDING_RETENTION_MONTHS，默认 6 个月，
       按每月 30 天算），和同步脚本、推荐近期论文池口径一致；
     - 按入库顺序从新到旧扫描 arxiv_oai_papers，每页先查向量库，只给缺向量的论文生成 embedding；
     - 已有向量的论文直接跳过，所以没有断点文件：中断或部分失败后重新运行即可接着补；
@@ -26,7 +26,7 @@
     EMBEDDING_PROVIDER / EMBEDDING_MODEL 等 EMBEDDING_*   embedding 配置，和后端、同步脚本用同一套
     MILVUS_URI                        向量库地址
     ARXIV_OAI_EMBEDDING_BATCH_SIZE    每次 embedding 请求的文本条数，默认 20
-    ARXIV_OAI_EMBEDDING_RETENTION_MONTHS  论文向量保留窗口（月），默认 4；0 表示不限、也不清理
+    ARXIV_OAI_EMBEDDING_RETENTION_MONTHS  论文向量保留窗口（月），默认 6；0 表示不限、也不清理
 
 输出与退出码:
     结束时以 JSON 输出统计，status 为 success / partial / interrupted / failed。

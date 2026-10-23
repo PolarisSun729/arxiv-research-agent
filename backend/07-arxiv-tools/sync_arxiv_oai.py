@@ -9,7 +9,7 @@
 
 向量保留窗口:
     只给首次提交日期（created，缺失时用 updated / oai_datestamp）在最近
-    ARXIV_OAI_EMBEDDING_RETENTION_MONTHS 个月（按每月 30 天算，默认 4）内的论文生成向量。
+    ARXIV_OAI_EMBEDDING_RETENTION_MONTHS 个月（按每月 30 天算，默认 6）内的论文生成向量。
     同步成功结束后删除窗口外的论文向量，任何用户点赞或点踩过的论文除外；清理失败只记日志，不影响退出码。
 
 向量失败:
@@ -44,7 +44,7 @@
     OAI_SQLITE_DATABASE_PATH     OAI 库路径，默认 backend/06-database/arxiv_oai.db
     HTTP_PROXY / HTTPS_PROXY     requests 会自动读取，国内网络访问 arXiv 时需要设置
     ARXIV_OAI_EMBEDDING_BATCH_SIZE  每次 embedding 请求的文本条数，默认 20
-    ARXIV_OAI_EMBEDDING_RETENTION_MONTHS  论文向量保留窗口（月），默认 4
+    ARXIV_OAI_EMBEDDING_RETENTION_MONTHS  论文向量保留窗口（月），默认 6
 
 退出码:
     0 = 全部日期成功（含没有新的完整日期可同步）；1 = 某一天同步失败，或另一个同步正在运行；
