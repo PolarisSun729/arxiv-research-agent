@@ -20,8 +20,8 @@ from pydantic import ValidationError
 from ..utils.search_spec_builder import ABSTRACT_HINT_PATTERNS, MAX_CORE_CONCEPTS
 from ..utils.text_utils import _extract_json_block, _matches_any, _normalize_text
 from ..intent_definitions import (
-    LLM_CLASSIFICATION_GUIDANCE,
     LLM_INTENT_CHOICES,
+    LLM_INTENT_DEFINITIONS,
     NON_SEARCH_INTENTS,
     PARSE_SUPPORTED_INTENTS,
 )
@@ -441,21 +441,29 @@ def _build_llm_prompt_with_profile(message: str, research_profile: Optional[Mapp
     """构造给 LLM 的意图识别提示词。
     
     主要内容包括：
-    1. 限定可选 intent，减少模型自由发挥空间；
-    2. 要求把检索主题拆成 concepts（主术语 + 同义写法 + 原话依据）和 optional_terms；
+    1. 先分类：逐条给出 intent 定义，按"用户要 Agent 做什么"判断，不按用词匹配标签名；
+       reasoning_summary 排在 intent 之前，让模型先说清判断再给结论；
+    2. 再抽取：仅 arxiv_search 时把检索主题拆成 concepts（主术语 + 同义写法 + 原话依据）和 optional_terms；
     3. 研究画像不再注入 prompt：画像只用于结果排序，避免模型把画像主题混进检索条件。
        research_profile 参数保留只是为了兼容调用方签名。
-    
+
     输出：返回完整 prompt 字符串，不直接触发调用。
     """
     del research_profile
     return (
-        "You are an intent parser for a natural-language arXiv paper agent.\n"
+        "You are the request parser of a natural-language arXiv paper agent.\n"
         "Return JSON only.\n"
-        f"Classify the message into one of: {', '.join(LLM_INTENT_CHOICES)}.\n"
-        "If it is a search request, extract a structured search spec.\n"
+        "Step 1: classify the user message into exactly one intent. "
+        "Decide by what the user wants the agent to do, not by the words used to ask for it. "
+        "A specific paper may be given by title, arXiv ID or a reference such as 'this paper'; "
+        "which paper a reference points to is resolved later from the conversation.\n"
+        "Intents:\n"
+        + "".join(f"- {name}: {definition}\n" for name, definition in LLM_INTENT_DEFINITIONS)
+        + "Step 2: only if the intent is arxiv_search, fill the search fields following the search spec rules below.\n"
+        "Step 3: only if the intent is preference_action, fill preference_operation following the preference rules below.\n"
         "Schema:\n"
         "{"
+        '\"reasoning_summary\":string (one sentence: what the user wants the agent to do, and why that is the chosen intent),'
         f'\"intent\":\"{"|".join(LLM_INTENT_CHOICES)}\",'
         '\"confidence\":0.0,'
         '\"concepts\":[{\"term\":string,\"aliases\":[string],\"evidence\":string}],'
@@ -464,7 +472,6 @@ def _build_llm_prompt_with_profile(message: str, research_profile: Optional[Mapp
         '\"abstract_query\":null|string,'
         '\"submitted_days_ago\":null|int,'
         '\"max_results\":null|int,'
-        '\"reasoning_summary\":null|string,'
         '\"missing_info\":[],'
         '\"warnings\":[],'
         '\"next_actions\":[],'
@@ -491,9 +498,7 @@ def _build_llm_prompt_with_profile(message: str, research_profile: Optional[Mapp
         "optional_terms 'orchestration', 'representation', 'generation'. Leave it empty if there are none.\n"
         "- submitted_days_ago / max_results: null unless the user stated them.\n"
         "- title_query / abstract_query: only when the user explicitly asks to search the title/abstract.\n"
-        "Guidance:\n"
-        + "".join(f"- {line}\n" for line in LLM_CLASSIFICATION_GUIDANCE)
-        + f"User message: {message}\n"
+        f"User message: {message}\n"
     )
 
 
