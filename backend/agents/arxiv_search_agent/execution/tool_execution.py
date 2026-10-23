@@ -161,7 +161,8 @@ class ToolExecutionService:
                     },
                     recoverable=True,
                     stage="input_validation",
-                    suggested_recovery="ask_clarification",
+                    # 输入由计划绑定拼出，校验失败是计划/契约问题，用户补充信息也修不好，不能转成追问。
+                    suggested_recovery="fallback_answer",
                 ),
                 adapter_name=contract.adapter.__class__.__name__,
                 tool_name=contract.tool_name,

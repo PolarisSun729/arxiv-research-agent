@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..fallbacks import build_fallback_record
 from .base import BaseToolAdapter, backend_tool_error
@@ -47,6 +47,15 @@ class GenerateRecommendationsInput(BaseModel):
     candidate_papers: Optional[List[Dict[str, Any]]] = None
     user_id: Optional[str] = None
     message: Optional[str] = None
+
+    @field_validator("candidate_papers", mode="before")
+    @classmethod
+    def _coerce_candidate_papers(cls, value: Any) -> Any:
+        # step_output 绑定传的是 load_candidate_papers 的完整输出 {"candidate_papers": [...]}；
+        # 推荐工具只需要候选列表，因此在 adapter 边界展开，避免整份输出因类型不匹配被判输入校验失败。
+        if isinstance(value, Mapping):
+            return value.get("candidate_papers")
+        return value
 
 
 class RecommendationResultOutput(BaseModel):

@@ -427,7 +427,7 @@ class LLMPlanDraftGenerator:
                             {
                                 "input_key": "string",
                                 "source_type": "state|context|goal|search_spec|step_output|literal",
-                                "source_key": "optional string",
+                                "source_key": "optional string; key inside state/context/goal/search_spec. step_output always passes that step's whole output, so leave it empty there",
                                 "step_id": "optional dependency step id",
                                 "required": True,
                                 "value": "optional literal",
