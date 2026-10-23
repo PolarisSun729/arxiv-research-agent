@@ -444,8 +444,11 @@ class RecommendationRanker:
         多样性信号优先级：语义（与已选项的最大向量相似度）+ 兴趣簇重复度；
         两者都不可用时才使用分类重复度兜底。
 
-        注意：该方法会原地修改传入的候选 dict（写入 selection_rank、final_score、diversity_debug 等），
-        并清理入选候选的排序临时字段。final_score 在种子阶段是归一化相关性，在贪心阶段是 selection_score。
+        多样性只决定哪些候选入选，不改写 final_score；入选结果最终按 final_score 从高到低返回，
+        使展示顺序与卡片上的综合分一致。入选顺序与当轮选择分记在 selection_rank / selection_score 供调试。
+
+        注意：该方法会原地修改传入的候选 dict（写入 selection_rank、selection_score、diversity_debug 等），
+        并清理入选候选的排序临时字段。
 
         性能：候选向量在开始时一次性归一化并按维度分组成矩阵；每入选一篇论文，只用一次矩阵乘法
         增量更新“每个候选与已选集合的最大相似度”。整体约 O(top_n × 候选数 × 向量维度)，
@@ -527,6 +530,7 @@ class RecommendationRanker:
         def annotate_selected_candidate(
             candidate: Dict[str, Any],
             selection_rank: int,
+            selection_score: float,
             relevance_score: float,
             diversity_score: float,
             semantic_diversity_score: Optional[float],
@@ -545,12 +549,12 @@ class RecommendationRanker:
                     "semantic_diversity_score": semantic_diversity_score,
                     "cluster_diversity_score": cluster_diversity_score,
                     "category_diversity_score": category_diversity_score,
-                    "selection_score": candidate.get("final_score", 0.0),
+                    "selection_score": selection_score,
                 }
             )
             candidate["selection_rank"] = selection_rank
             candidate["relevance_score"] = relevance_score
-            candidate["selection_score"] = candidate.get("final_score", 0.0)
+            candidate["selection_score"] = selection_score
             candidate["diversity_score"] = diversity_score
             candidate["score_breakdown"] = score_breakdown
             candidate["diversity_debug"] = {
@@ -622,6 +626,7 @@ class RecommendationRanker:
         def commit_selected_candidate(
             index: int,
             selection_rank: int,
+            selection_score: float,
             diversity_reason: str,
             diversity_score: float,
             semantic_diversity_score: Optional[float],
@@ -634,7 +639,7 @@ class RecommendationRanker:
             nonlocal has_selected_embedding
             candidate = candidates[index]
             remaining.remove(index)
-            annotate_selected_candidate(candidate, selection_rank, relevance_scores[index], diversity_score, semantic_diversity_score, cluster_diversity_score, category_diversity_score, diversity_reason, diversity_penalty_source, diversity_penalty_value)
+            annotate_selected_candidate(candidate, selection_rank, selection_score, relevance_scores[index], diversity_score, semantic_diversity_score, cluster_diversity_score, category_diversity_score, diversity_reason, diversity_penalty_source, diversity_penalty_value)
             unit_vector = unit_vectors[index]
             if unit_vector is not None:
                 has_selected_embedding = True
@@ -668,14 +673,12 @@ class RecommendationRanker:
             for index in ordered_cluster_indexes:
                 if len(selected) >= top_n:
                     break
-                candidates[index]["final_score"] = normalized_relevance[index]
-                commit_selected_candidate(index, len(selected) + 1, "cluster_seed", 1.0, None, None, None)
+                commit_selected_candidate(index, len(selected) + 1, normalized_relevance[index], "cluster_seed", 1.0, None, None, None)
 
         if not selected and remaining:
             # 没有兴趣簇种子时，用相关性最高的候选作为唯一种子。
             first_index = max(remaining, key=candidate_priority)
-            candidates[first_index]["final_score"] = normalized_relevance[first_index]
-            commit_selected_candidate(first_index, 1, "seed", 1.0, None, None, None)
+            commit_selected_candidate(first_index, 1, normalized_relevance[first_index], "seed", 1.0, None, None, None)
 
         # 第二步：贪心地每轮选出 selection_score 最高的候选。
         while remaining and len(selected) < top_n:
@@ -695,7 +698,6 @@ class RecommendationRanker:
                 break
 
             diversity_score, semantic_diversity_score, cluster_diversity_score, category_diversity_score, diversity_reason, semantic_similarity_penalty = best_diversity_data
-            candidates[best_index]["final_score"] = best_selection_score
             if semantic_similarity_penalty is not None:
                 diversity_penalty_source: Optional[str] = "semantic"
                 diversity_penalty_value = semantic_similarity_penalty
@@ -705,6 +707,7 @@ class RecommendationRanker:
             commit_selected_candidate(
                 index=best_index,
                 selection_rank=len(selected) + 1,
+                selection_score=best_selection_score,
                 diversity_reason=diversity_reason,
                 diversity_score=diversity_score,
                 semantic_diversity_score=semantic_diversity_score,
@@ -714,6 +717,8 @@ class RecommendationRanker:
                 diversity_penalty_value=diversity_penalty_value,
             )
 
+        # 入选集合确定后按综合分展示；同分时保留入选顺序（sort 稳定）。
+        selected.sort(key=lambda item: float(item.get("final_score", 0.0) or 0.0), reverse=True)
         return selected
 
     # ------------------------------------------------------------------
