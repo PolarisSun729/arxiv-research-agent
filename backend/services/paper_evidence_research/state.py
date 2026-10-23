@@ -142,6 +142,8 @@ class ResearchDecisionContext(BaseModel):
     candidate_count: int
     current_draft_version: int | None
     claim_assessments: list[ClaimAssessment]
+    # 最新草稿拆出的主张原文与其回应的需求；只给 verdict 时决策器看不出草稿写了什么、漏了什么。
+    claims: list[AnswerClaim] = Field(default_factory=list)
     retrievals_remaining: int
     drafts_remaining: int
     # 规则兜底策略所需的最小进度信息：已消耗的检索轮数与已有候选覆盖到的需求集合。
