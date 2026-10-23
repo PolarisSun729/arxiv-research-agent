@@ -326,6 +326,9 @@ ARXIV_OAI_CONFIG: Dict[str, Any] = {
     "embedding_batch_size": _env_int("ARXIV_OAI_EMBEDDING_BATCH_SIZE", 20),
     "vector_query_batch_size": _env_int("ARXIV_OAI_VECTOR_QUERY_BATCH_SIZE", 100),
     "dashscope_text_token_price_per_1k": float(_env_str("ARXIV_OAI_DASHSCOPE_TEXT_TOKEN_PRICE_PER_1K", "0.0007")),
+    # 论文向量只保留首次提交在最近 N 个月内的论文（按 N*30 天算，和推荐近期论文池的口径一致）；
+    # 同步和补向量不给更早的论文生成向量，同步结束时删掉移出窗口的向量（点赞/点踩过的除外）。0 表示不限。
+    "embedding_retention_months": _env_int("ARXIV_OAI_EMBEDDING_RETENTION_MONTHS", 4),
 }
 
 VECTOR_STORE_CONFIG: Dict[str, Any] = {

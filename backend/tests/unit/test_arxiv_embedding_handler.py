@@ -51,6 +51,7 @@ class FakeVectorStore:
         self.query_error = query_error
         self.insert_error = insert_error
         self.inserted: List[Dict[str, Any]] = []
+        self.prune_calls: List[Dict[str, Any]] = []
 
     def get_paper_embeddings_by_arxiv_ids(self, collection_name: str, arxiv_ids: List[str]) -> List[Dict[str, Any]]:
         if self.query_error is not None:
@@ -67,14 +68,23 @@ class FakeVectorStore:
         self.inserted.append({"embedding": embedding, "metadata": metadata})
         return len(self.inserted)
 
+    def delete_paper_embeddings_published_before(self, **kwargs: Any) -> int:
+        self.prune_calls.append(kwargs)
+        return 3
 
-def _handler(embedding_service: FakeEmbeddingService, vector_store: FakeVectorStore) -> ArxivEmbeddingHandler:
+
+def _handler(
+    embedding_service: FakeEmbeddingService,
+    vector_store: FakeVectorStore,
+    min_paper_date: Optional[str] = None,
+) -> ArxivEmbeddingHandler:
     return ArxivEmbeddingHandler(
         embedding_service=embedding_service,
         vector_store_service=vector_store,
         embedding_collection_name="arxiv_paper_embeddings",
         vector_query_batch_size=2,
         token_price_per_1k=1.0,
+        min_paper_date=min_paper_date,
     )
 
 
@@ -138,3 +148,45 @@ def test_find_papers_missing_embeddings_checks_vector_store_in_batches() -> None
     missing = _handler(FakeEmbeddingService(), vector_store).find_papers_missing_embeddings(papers)
 
     assert [paper["arxiv_id"] for paper in missing] == ["2610.00001", "2610.00002", "2610.00004", "2610.00005"]
+
+
+def test_papers_first_submitted_before_window_are_not_embedded() -> None:
+    embedding_service = FakeEmbeddingService()
+    vector_store = FakeVectorStore()
+    papers = [
+        _paper("2610.00001", created="2026-10-20"),
+        # 旧论文最近改过版本：updated / datestamp 很新，但按首次提交日期仍在窗口外。
+        _paper("2401.00001", created="2024-01-05", updated="2026-10-20", oai_datestamp="2026-10-21"),
+        # 日期全缺的无法判断新旧，按窗口内处理。
+        _paper("2610.00002", created="", updated="", oai_datestamp=""),
+    ]
+
+    handler = _handler(embedding_service, vector_store, min_paper_date="2026-06-25")
+    stats = handler.store_paper_embeddings_batch(papers)
+
+    assert [item["metadata"]["arxiv_id"] for item in vector_store.inserted] == ["2610.00001", "2610.00002"]
+    assert (stats.embeddings_attempted, stats.embeddings_skipped_out_of_window) == (2, 1)
+    assert [paper["arxiv_id"] for paper in handler.find_papers_missing_embeddings(papers)] == ["2610.00001", "2610.00002"]
+
+
+def test_prune_out_of_window_passes_cutoff_and_kept_ids_to_vector_store() -> None:
+    vector_store = FakeVectorStore()
+
+    deleted = _handler(FakeEmbeddingService(), vector_store, min_paper_date="2026-06-25").prune_out_of_window({"2401.00001"}, dry_run=True)
+
+    assert deleted == 3
+    assert vector_store.prune_calls == [
+        {
+            "collection_name": "arxiv_paper_embeddings",
+            "cutoff_date": "2026-06-25",
+            "keep_arxiv_ids": {"2401.00001"},
+            "dry_run": True,
+        }
+    ]
+
+
+def test_prune_out_of_window_is_noop_without_window() -> None:
+    vector_store = FakeVectorStore()
+
+    assert _handler(FakeEmbeddingService(), vector_store).prune_out_of_window(set()) == 0
+    assert vector_store.prune_calls == []

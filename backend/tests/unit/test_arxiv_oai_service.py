@@ -52,6 +52,7 @@ try:
         OAI_INDEX_REBUILD_STALE_SECONDS,
         ArxivOaiDatabaseService,
         ArxivOaiSyncService,
+        embedding_window_start,
     )
 finally:
     # 轻量桩只服务本模块导入；恢复公共模块，避免 pytest 混跑时污染后续真实服务测试。
@@ -708,3 +709,24 @@ def test_get_latest_oai_datestamp_returns_max_date_or_none() -> None:
     assert service.upsert_arxiv_oai_papers([older, newer]) == 2
 
     assert service.get_latest_oai_datestamp() == date(2026, 9, 11)
+
+
+def test_embedding_window_start_uses_thirty_day_months() -> None:
+    assert embedding_window_start(4, today=date(2026, 10, 23)) == "2026-06-25"
+    assert embedding_window_start(0, today=date(2026, 10, 23)) is None
+
+
+def test_backfill_scan_filters_by_first_submission_date_newest_first() -> None:
+    service = _make_temp_service()
+    recent = _paper("2610.00001", title="Recent", abstract="a", categories=["cs.CL"], created="2026-10-01")
+    # 旧论文新近改版：oai_datestamp 很新，但首次提交早于起点，不应被扫描到。
+    revised = _paper("2401.00001", title="Revised", abstract="b", categories=["cs.CL"], created="2024-01-05", updated="2026-10-02")
+    revised["oai_datestamp"] = "2026-10-03"
+    newest = _paper("2610.00002", title="Newest", abstract="c", categories=["cs.CL"], created="2026-10-02")
+    assert service.upsert_arxiv_oai_papers([recent, revised, newest]) == 3
+
+    pages = list(service.iter_papers_newest_first(since="2026-06-25", page_size=1))
+
+    assert [[paper["arxiv_id"] for paper in page] for page in pages] == [["2610.00002"], ["2610.00001"]]
+    assert service.count_papers_since("2026-06-25") == 2
+    assert service.count_papers_since(None) == 3

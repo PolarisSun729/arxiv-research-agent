@@ -7,7 +7,7 @@
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +18,7 @@ class EmbeddingStats:
     embeddings_attempted: int = 0
     embeddings_written: int = 0
     embeddings_skipped_existing: int = 0
+    embeddings_skipped_out_of_window: int = 0
     embedding_errors: int = 0
     embedding_input_tokens: int = 0
     embedding_output_tokens: int = 0
@@ -36,6 +37,7 @@ class ArxivEmbeddingHandler:
         embedding_batch_size: int = 25,
         vector_query_batch_size: int = 100,
         token_price_per_1k: float = 0.0007,
+        min_paper_date: Optional[str] = None,
     ):
         """初始化 Embedding 处理器。
 
@@ -46,6 +48,7 @@ class ArxivEmbeddingHandler:
             embedding_batch_size: 批量生成 embedding 的大小
             vector_query_batch_size: 批量查询向量的大小
             token_price_per_1k: 每千 token 的价格（元）
+            min_paper_date: 向量保留窗口起点（YYYY-MM-DD），更早的论文不生成向量；None 表示不限
         """
         self.embedding_service = embedding_service
         self.vector_store_service = vector_store_service
@@ -53,6 +56,7 @@ class ArxivEmbeddingHandler:
         self.embedding_batch_size = embedding_batch_size
         self.vector_query_batch_size = vector_query_batch_size
         self.token_price_per_1k = token_price_per_1k
+        self.min_paper_date = min_paper_date
         self.embedding_config = embedding_service.get_default_embedding_config()
 
     def store_paper_embeddings_batch(
@@ -76,6 +80,9 @@ class ArxivEmbeddingHandler:
             stats = EmbeddingStats()
 
         eligible_papers = self._eligible_papers(papers)
+        in_window_papers = self._papers_in_window(eligible_papers)
+        stats.embeddings_skipped_out_of_window += len(eligible_papers) - len(in_window_papers)
+        eligible_papers = in_window_papers
         if not eligible_papers:
             return stats
 
@@ -144,8 +151,30 @@ class ArxivEmbeddingHandler:
         return stats
 
     def find_papers_missing_embeddings(self, papers: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """返回有标题和摘要、但向量库里还没有向量的论文；向量库查询失败时直接抛出。"""
-        return self._exclude_embedded_papers(self._eligible_papers(papers))
+        """返回在保留窗口内、有标题和摘要、但向量库里还没有向量的论文；向量库查询失败时直接抛出。"""
+        return self._exclude_embedded_papers(self._papers_in_window(self._eligible_papers(papers)))
+
+    def prune_out_of_window(self, keep_arxiv_ids: Set[str], dry_run: bool = False) -> int:
+        """删除首次提交早于保留窗口的论文向量，keep_arxiv_ids（用户点赞/点踩过的论文）除外；返回删除条数。"""
+        if not self.min_paper_date:
+            return 0
+        return self.vector_store_service.delete_paper_embeddings_published_before(
+            collection_name=self.embedding_collection_name,
+            cutoff_date=self.min_paper_date,
+            keep_arxiv_ids=keep_arxiv_ids,
+            dry_run=dry_run,
+        )
+
+    def _papers_in_window(self, papers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """只保留首次提交不早于窗口起点的论文；日期缺失的无法判断新旧，按窗口内处理。"""
+        if not self.min_paper_date:
+            return papers
+        return [paper for paper in papers if not self._paper_date(paper) or self._paper_date(paper) >= self.min_paper_date]
+
+    @staticmethod
+    def _paper_date(paper: Dict[str, Any]) -> str:
+        """论文日期：首次提交日期优先，和写入向量库的 published_date、推荐近期论文池的日期口径一致。"""
+        return str(paper.get("created") or paper.get("updated") or paper.get("oai_datestamp") or "").strip()
 
     @staticmethod
     def _eligible_papers(papers: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -220,9 +249,7 @@ class ArxivEmbeddingHandler:
             "title": str(paper.get("title", "") or "").strip(),
             "authors": self._join_list_field(paper.get("authors", "")),
             "categories": self._join_list_field(paper.get("categories", "")),
-            "published_date": str(
-                paper.get("created") or paper.get("updated") or paper.get("oai_datestamp") or ""
-            ).strip(),
+            "published_date": self._paper_date(paper),
             "url": str(paper.get("abs_url") or paper.get("pdf_url") or "").strip(),
             "embedding_model": self.embedding_config.model_name,
         }

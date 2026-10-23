@@ -10,10 +10,13 @@ rem Double-click launcher for backfilling arXiv OAI paper embeddings (local Wind
 rem
 rem Runs backfill_arxiv_oai_embeddings.py, which scans arxiv_oai_papers from newest to
 rem oldest and embeds every paper that has no vector in arxiv_paper_embeddings yet.
+rem Only papers first submitted inside the retention window are embedded
+rem (ARXIV_OAI_EMBEDDING_RETENTION_MONTHS, default 4 months of 30 days). After that,
+rem vectors of older papers are deleted, except papers some user liked or disliked.
 rem Papers that already have a vector are skipped, so it is safe to stop and run again.
 rem This launcher passes no extra options and embeds ALL missing papers (this costs
-rem embedding API money). To only count what is missing, or to cap one run, use the
-rem backend folder, for example:
+rem embedding API money). To only count what is missing and what would be deleted,
+rem or to cap one run, use the backend folder, for example:
 rem   python 07-arxiv-tools\backfill_arxiv_oai_embeddings.py --dry-run
 rem   python 07-arxiv-tools\backfill_arxiv_oai_embeddings.py --limit 2000
 rem It shares the lock file with the OAI sync, so it exits if a sync is running.

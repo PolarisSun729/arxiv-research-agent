@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from services.storage.sqlite.base import BaseSqliteStore
 from services.storage.sqlite.shared import DEFAULT_USER_ID, logger
@@ -381,6 +381,21 @@ class UserPreferenceStore(BaseSqliteStore):
                 continue
             action_map.setdefault(action_key, []).append(arxiv_id)
         return action_map
+
+    def get_all_labeled_paper_ids(self) -> Set[str]:
+        """返回所有用户喜欢或不喜欢过的论文 ID。
+
+        供论文向量的保留清理排除用：读取失败必须抛出，返回空集合会让清理误删这些论文的向量。
+        """
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                '''
+                SELECT arxiv_id FROM user_liked_papers
+                UNION
+                SELECT arxiv_id FROM user_disliked_papers
+                '''
+            ).fetchall()
+        return {str(row[0]).strip() for row in rows if row[0] and str(row[0]).strip()}
 
     def get_user_labeled_paper_count(self, user_id: str = DEFAULT_USER_ID) -> int:
         """统计用户做过强偏好标记的论文数（喜欢与不喜欢合并去重），用于判断画像冷启动。"""

@@ -7,6 +7,11 @@
     落库成功的论文会同时用当前 embedding 配置生成论文向量，写入 Milvus 的 arxiv_paper_embeddings，
     推荐的兴趣簇召回只在这个 collection 里找论文。--dry-run / --count-only 不生成向量。
 
+向量保留窗口:
+    只给首次提交日期（created，缺失时用 updated / oai_datestamp）在最近
+    ARXIV_OAI_EMBEDDING_RETENTION_MONTHS 个月（按每月 30 天算，默认 4）内的论文生成向量。
+    同步成功结束后删除窗口外的论文向量，任何用户点赞或点踩过的论文除外；清理失败只记日志，不影响退出码。
+
 向量失败:
     embedding 或向量库出错只计入摘要里的 embedding_errors，不算当天失败，游标照常推进；
     漏掉的论文用 backfill_arxiv_oai_embeddings.py 补齐（它会跳过已有向量的论文，重复运行也安全）。
@@ -39,6 +44,7 @@
     OAI_SQLITE_DATABASE_PATH     OAI 库路径，默认 backend/06-database/arxiv_oai.db
     HTTP_PROXY / HTTPS_PROXY     requests 会自动读取，国内网络访问 arXiv 时需要设置
     ARXIV_OAI_EMBEDDING_BATCH_SIZE  每次 embedding 请求的文本条数，默认 20
+    ARXIV_OAI_EMBEDDING_RETENTION_MONTHS  论文向量保留窗口（月），默认 4
 
 退出码:
     0 = 全部日期成功（含没有新的完整日期可同步）；1 = 某一天同步失败，或另一个同步正在运行；
@@ -61,10 +67,16 @@ BACKEND_DIR = ROOT_DIR.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from services.arxiv.arxiv_oai_service import ArxivOaiDatabaseService, ArxivOaiSyncService  # noqa: E402
+from services.arxiv.arxiv_oai_service import (  # noqa: E402
+    ArxivOaiDatabaseService,
+    ArxivOaiSyncService,
+    prune_out_of_window_embeddings,
+)
 from services.arxiv.oai_incremental_sync import IncrementalSyncOptions, run_incremental_sync  # noqa: E402
 from utils.config import OAI_SQLITE_CONFIG  # noqa: E402
 from utils.storage_paths import ARXIV_OAI_SYNC_STATE_FILE, resolve_backend_artifact_path  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_date(value: str) -> date:
@@ -140,12 +152,20 @@ def main() -> int:
         dry_run=args.dry_run,
         count_only=args.count_only,
     )
-    return run_incremental_sync(
+    exit_code = run_incremental_sync(
         options,
         sync_day=lambda day: service.sync(day, day, dry_run=args.dry_run, count_only=args.count_only),
         latest_datestamp=lambda: ArxivOaiDatabaseService().get_latest_oai_datestamp(),
         pause=lambda: time.sleep(service.request_interval_seconds),
     )
+    if service.embedding_handler is not None and exit_code == 0:
+        # 清理移出保留窗口的向量只影响推荐召回范围，失败不改变同步本身的退出码，下次同步会再清。
+        try:
+            pruned = prune_out_of_window_embeddings(service.embedding_handler)
+            logger.info("Pruned %s paper embeddings older than %s", pruned, service.embedding_handler.min_paper_date)
+        except Exception:
+            logger.exception("Failed to prune out-of-window paper embeddings")
+    return exit_code
 
 
 if __name__ == "__main__":
