@@ -7,7 +7,7 @@
 
 运行方式:
     - 单个后台线程，lifespan 启动、退出时停止；启动后延迟一段时间再跑第一轮，避开预热高峰；
-    - 每轮按入库顺序从新到旧扫描窗口内论文，只给向量库里没有的论文生成 embedding，一次只发一批请求；
+    - 每轮先一次取出向量库已有的 arxiv_id，再按入库顺序从新到旧扫描窗口内论文，只给没有向量的论文生成 embedding，一次只发一批请求；
     - 不存游标：是否缺向量始终以向量库为准，中断或重启后下一轮重新扫描即可接着补，已写的不会重复花钱；
     - 单轮写入达到上限就提前结束、短暂休息后继续，长时间的补齐被拆成可中断的短轮次；
     - 整批失败（接口报错、限流、向量库写入失败）按 1、2、4…分钟退避，最长 30 分钟；
@@ -243,12 +243,19 @@ class OaiEmbeddingMaintainer:
         scanned = 0
         missing_found = 0
         status = "covered"
+        # 开轮时一次取出向量库里已有的 arxiv_id，扫描时在内存里比对：逐页按 id 查向量库每次都要筛全表，已补的越多越慢。
+        # 本轮期间别处新写的论文可能仍被当成缺失，写入前 store_paper_embeddings_batch 还会再查一次，不会重复生成。
+        embedded_arxiv_ids = handler.list_embedded_arxiv_ids()
         for page in database_service.iter_papers_newest_first(since=window_start, page_size=self.page_size):
             if self._stop_event.is_set():
                 status = "stopped"
                 break
             scanned += len(page)
-            missing_papers = [paper for paper in handler.find_papers_missing_embeddings(page) if self._paper_id(paper) not in self._skipped_arxiv_ids]
+            missing_papers = [
+                paper
+                for paper in handler.find_papers_missing_embeddings(page, embedded_arxiv_ids=embedded_arxiv_ids)
+                if self._paper_id(paper) not in self._skipped_arxiv_ids
+            ]
             missing_found += len(missing_papers)
             status = self._embed_missing_papers(handler, missing_papers, stats)
             if status != "covered":

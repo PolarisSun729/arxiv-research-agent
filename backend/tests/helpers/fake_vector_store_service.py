@@ -154,6 +154,16 @@ class FakeVectorStoreService:
         self._record("get_existing_paper_arxiv_ids", collection_name=normalized, count=len(wanted & existing))
         return wanted & existing
 
+    def list_paper_arxiv_ids(self, collection_name: str) -> set[str]:
+        normalized = self._normalize_collection_name(collection_name)
+        existing = {
+            str(dict(row.get("metadata", {}) or {}).get("arxiv_id", ""))
+            for row in self.collections.get(normalized, [])
+        }
+        existing.discard("")
+        self._record("list_paper_arxiv_ids", collection_name=normalized, count=len(existing))
+        return existing
+
     def __del__(self) -> None:
         temp_dir = getattr(self, "temp_dir", None)
         if temp_dir is not None:
