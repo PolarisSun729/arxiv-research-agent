@@ -1491,7 +1491,9 @@ class LoadingService:
         return {
             "asset_exported": True,
             "asset_path": rel_path,
-            "asset_abs_path": os.path.abspath(output_path),
+            # 绝对路径记展开软链接后的真实位置：生产上 03-docling-assets 链接到 shared，
+            # 记成 releases/<版本>/backend/... 会在旧发布目录被清理后失效。
+            "asset_abs_path": os.path.realpath(output_path),
             "asset_summary": summary,
             "asset_file_name": output_name,
             "asset_caption": picture_caption,
@@ -1559,7 +1561,7 @@ class LoadingService:
                 "asset_exported": True,
                 "asset_export_reason": "bbox_fallback",
                 "asset_path": os.path.relpath(output_path, start=str(BACKEND_ROOT)),
-                "asset_abs_path": os.path.abspath(output_path),
+                "asset_abs_path": os.path.realpath(output_path),
                 "asset_summary": summary,
                 "asset_file_name": output_name,
                 "asset_caption": picture_caption,
@@ -1729,7 +1731,7 @@ class LoadingService:
             "asset_exported": True,
             "asset_path": rel_csv_path,
             "asset_json_path": rel_json_path,
-            "asset_abs_path": os.path.abspath(csv_path),
+            "asset_abs_path": os.path.realpath(csv_path),
             "asset_summary": summary,
             "asset_file_name": os.path.basename(csv_path),
             "asset_caption": table_caption,
