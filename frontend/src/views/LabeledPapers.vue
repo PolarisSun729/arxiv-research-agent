@@ -5,6 +5,7 @@ import { usePaperStore } from '@/stores/paperStore';
 import { ElMessage } from 'element-plus';
 import { MagicStick } from '@element-plus/icons-vue';
 import { getLabelText } from '@/utils/paperLabel';
+import { useAbstractTranslation } from '@/composables/useAbstractTranslation';
 
 const router = useRouter();
 const store = usePaperStore();
@@ -19,6 +20,7 @@ const filterOptions = [
   { value: 'disliked', label: '不感兴趣' }
 ];
 const expandedIds = ref(new Set<string>());
+const { displaySummary, isTranslating, translateButtonText, toggleTranslation } = useAbstractTranslation();
 
 function toggleExpanded(id: string) {
   const next = new Set(expandedIds.value);
@@ -294,13 +296,22 @@ async function handleGenerateInterestVector() {
           </span>
         </div>
 
-        <p :class="['paper-summary', { 'clamp-3': !expandedIds.has(paper.id) }]">{{ formatPaperSummary(paper.summary) }}</p>
+        <p :class="['paper-summary', { 'clamp-3': !expandedIds.has(paper.id) }]">{{ displaySummary(paper.arxivId || paper.id, formatPaperSummary(paper.summary)) }}</p>
 
         <div class="card-foot">
           <span class="muted">{{ paper.labeledAt ? `标记于 ${formatLabeledAt(paper.labeledAt)}` : '标记时间未知' }}</span>
           <div class="card-actions">
             <el-button link type="primary" @click="toggleExpanded(paper.id)">
               {{ expandedIds.has(paper.id) ? '收起摘要' : '展开摘要' }}
+            </el-button>
+            <el-button
+              v-if="paper.summary"
+              link
+              type="primary"
+              :disabled="isTranslating(paper.arxivId || paper.id)"
+              @click="toggleTranslation(paper.arxivId || paper.id)"
+            >
+              {{ translateButtonText(paper.arxivId || paper.id) }}
             </el-button>
             <el-button size="small" type="primary" plain @click="handleViewDetail(paper.id)">查看详情</el-button>
           </div>

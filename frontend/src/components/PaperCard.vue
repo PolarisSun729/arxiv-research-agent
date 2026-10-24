@@ -7,6 +7,7 @@ import SimilarityTag from './SimilarityTag.vue'
 import { toPercent } from '@/utils/format'
 import { getLabelText } from '@/utils/paperLabel'
 import { usePaperStore } from '@/stores/paperStore'
+import { useAbstractTranslation } from '@/composables/useAbstractTranslation'
 
 const props = defineProps<{
   paper: Paper | RecommendedPaper
@@ -192,6 +193,8 @@ function handleViewDetail() {
 }
 
 const summaryExpanded = ref(false)
+const { displaySummary, isTranslating, translateButtonText, toggleTranslation } = useAbstractTranslation()
+const translationId = computed(() => props.paper.arxivId || props.paper.id)
 const detailsOpen = ref(false)
 
 // 再次点击已选中的标记即取消标记。
@@ -232,10 +235,15 @@ function formatDate(dateStr: string) {
       <span v-for="cat in paper.categories" :key="cat" class="chip">{{ cat }}</span>
     </div>
 
-    <p :class="['paper-summary', { 'clamp-3': !summaryExpanded }]">{{ paper.summary }}</p>
-    <button v-if="paper.summary && paper.summary.length > 240" type="button" class="link-btn" @click="summaryExpanded = !summaryExpanded">
-      {{ summaryExpanded ? '收起摘要' : '展开摘要' }}
-    </button>
+    <p :class="['paper-summary', { 'clamp-3': !summaryExpanded }]">{{ displaySummary(translationId, paper.summary) }}</p>
+    <div v-if="paper.summary" class="summary-actions">
+      <button v-if="paper.summary.length > 240" type="button" class="link-btn" @click="summaryExpanded = !summaryExpanded">
+        {{ summaryExpanded ? '收起摘要' : '展开摘要' }}
+      </button>
+      <button type="button" class="link-btn" :disabled="isTranslating(translationId)" @click="toggleTranslation(translationId)">
+        {{ translateButtonText(translationId) }}
+      </button>
+    </div>
 
     <section v-if="showRecommendationMetrics || showAgentMetrics" class="match-panel">
       <div class="match-top">
@@ -450,6 +458,21 @@ function formatDate(dateStr: string) {
 
 .link-btn:hover {
   text-decoration: underline;
+}
+
+.link-btn:disabled {
+  color: var(--color-text-3);
+  cursor: default;
+  text-decoration: none;
+}
+
+.summary-actions {
+  display: flex;
+  gap: 14px;
+}
+
+.summary-actions .link-btn {
+  align-self: auto;
 }
 
 .match-panel {

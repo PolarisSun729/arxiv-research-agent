@@ -689,6 +689,7 @@ def test_rate_categories_follow_route_policies():
         ("POST", "/api/user/research-profile/rebuild"), ("POST", "/api/user/generate-interest-vector"),
         ("POST", "/api/user/recommend-papers"), ("GET", "/api/paper/{arxiv_id}"), ("POST", "/api/user/like-paper"),
         ("POST", "/api/user/dislike-paper"), ("POST", "/api/user/paper-action"),
+        ("POST", "/api/paper/{arxiv_id}/abstract-translation/stream"),
     }
     assert expensive <= set(ROUTE_POLICIES)
     for method, route in ROUTE_POLICIES:

@@ -8,6 +8,7 @@ from services.storage.sqlite.stores import (
     ApprovalGrantStore,
     InterestVectorStore,
     LangGraphCheckpointStore,
+    PaperAbstractTranslationStore,
     PaperCatalogStore,
     PaperChatMessageStore,
     PaperChatSessionStore,
@@ -44,6 +45,7 @@ class StorageContainer:
             self.profile_build_jobs,
         )
         self.paper_catalog = PaperCatalogStore(self.connection_provider)
+        self.paper_abstract_translations = PaperAbstractTranslationStore(self.connection_provider)
         self.user_preferences = UserPreferenceStore(
             self.connection_provider,
             self.profile_events,
