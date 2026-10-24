@@ -1,5 +1,6 @@
 import os
 import ast
+import functools
 from datetime import datetime
 import json
 import re
@@ -23,6 +24,27 @@ RERANK_TEXT_MAX_LENGTH = VECTOR_STORE_CONFIG["rerank_text_max_length"]
 ASSET_PATH_MAX_LENGTH = VECTOR_STORE_CONFIG["asset_path_max_length"]
 ASSET_SUMMARY_MAX_LENGTH = VECTOR_STORE_CONFIG["asset_summary_max_length"]
 ASSET_PREVIEW_MAX_LENGTH = VECTOR_STORE_CONFIG["asset_preview_max_length"]
+
+
+@functools.lru_cache(maxsize=None)
+def cap_milvus_lite_compaction(max_segment_rows: int) -> bool:
+    """限制 Milvus Lite 单次合并的行数，返回是否生效（没装 milvus_lite 或版本不认识时返回 False）。
+
+    Milvus Lite 在进程内运行，攒够 4 个同档大小的数据文件就把它们整份读进内存合并，峰值约为数据的 4 倍；
+    默认上限 10 万行，论文向量补到 4.7 万篇时一次合并就把 Web 进程顶到 MemoryMax 被 OOM。
+    它只在合并时读取模块级常量 MAX_SEGMENT_ROWS，这里改的就是这个值（milvus-lite 版本已在 lock 文件锁定）。
+    """
+    try:
+        from milvus_lite.engine import compaction
+    except ImportError:
+        return False
+    if not hasattr(compaction, "MAX_SEGMENT_ROWS"):
+        logger.warning("milvus_lite.engine.compaction has no MAX_SEGMENT_ROWS; compaction cap not applied")
+        return False
+    if compaction.MAX_SEGMENT_ROWS != max_segment_rows:
+        logger.info("Capping Milvus Lite compaction: max_segment_rows %s -> %s", compaction.MAX_SEGMENT_ROWS, max_segment_rows)
+        compaction.MAX_SEGMENT_ROWS = max_segment_rows
+    return True
 
 
 # chunk 级 collection 检索/导出时希望带回的字段（按需与实际 schema 求交集，旧 collection 缺字段也能读）。
@@ -317,6 +339,7 @@ class VectorStoreService:
 
     def _get_client(self) -> MilvusClient:
         """每次调用创建一个新的 Milvus 客户端；客户端不跨请求复用，避免连接状态在线程间共享。"""
+        cap_milvus_lite_compaction(MILVUS_CONFIG["lite_max_segment_rows"])
         return MilvusClient(uri=MILVUS_CONFIG["uri"])
 
     def resolve_collection_name(self, collection_name: str) -> str:

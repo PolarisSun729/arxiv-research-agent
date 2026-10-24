@@ -166,6 +166,9 @@ MILVUS_CONFIG: Dict[str, Any] = {
         "ivf_sq8": {"nlist": 1024},
         "hnsw": {"M": 16, "efConstruction": 500},
     },
+    # Milvus Lite 合并数据文件时把输入整份读进内存再复制几份，峰值约每行 40–55KB（2048 维）；
+    # 一次最多合并 2 倍这么多行，更大的文件不再参与合并。默认 8000 → 单次峰值约 +0.9GB。
+    "lite_max_segment_rows": _env_int("MILVUS_LITE_MAX_SEGMENT_ROWS", 8000),
 }
 
 SQLITE_CONFIG: Dict[str, Any] = {
