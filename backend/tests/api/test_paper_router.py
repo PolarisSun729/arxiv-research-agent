@@ -165,6 +165,20 @@ class PaperRouterApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["lastSyncedDate"], "2026-06-03")
 
+    def test_sync_status_includes_embedding_maintenance_and_manual_run_needs_it_enabled(self) -> None:
+        maintainer = types.SimpleNamespace(get_status=lambda: {"running": False, "last_round": None}, request_run=lambda: True)
+        self.client.app.dependency_overrides[paper_router.get_oai_embedding_maintainer] = lambda: maintainer
+
+        payload = self.client.get("/api/sync-status").json()
+        self.assertEqual(payload["embeddingMaintenance"], {"enabled": False, "running": False, "last_round": None})
+
+        # 默认关闭：不能通过接口绕过开关去调用付费 embedding。
+        self.assertEqual(self.client.post("/api/sync-status/embedding-maintenance/run").status_code, 409)
+        with mock.patch.dict(paper_router.ARXIV_OAI_CONFIG, {"embedding_maintainer_enabled": True}):
+            response = self.client.post("/api/sync-status/embedding-maintenance/run")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["accepted"])
+
     def test_sync_status_reads_persistent_files_and_degrades_on_corrupt_values(self) -> None:
         # 本类的 API 测试默认替换聚合函数；这里恢复真实实现以覆盖文件读取边界。
         self.sync_patch.stop()

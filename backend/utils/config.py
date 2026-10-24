@@ -327,8 +327,15 @@ ARXIV_OAI_CONFIG: Dict[str, Any] = {
     "vector_query_batch_size": _env_int("ARXIV_OAI_VECTOR_QUERY_BATCH_SIZE", 100),
     "dashscope_text_token_price_per_1k": float(_env_str("ARXIV_OAI_DASHSCOPE_TEXT_TOKEN_PRICE_PER_1K", "0.0007")),
     # 论文向量只保留首次提交在最近 N 个月内的论文（按 N*30 天算，和推荐近期论文池的口径一致，默认值也与推荐的 6 个月对齐）；
-    # 同步和补向量不给更早的论文生成向量，同步结束时删掉移出窗口的向量（点赞/点踩过的除外）。0 表示不限。
+    # 维护任务不给更早的论文生成向量，并每天删掉移出窗口的向量（点赞/点踩过的除外）。0 表示不限、也不清理。
     "embedding_retention_months": _env_int("ARXIV_OAI_EMBEDDING_RETENTION_MONTHS", 6),
+    # 论文向量维护任务：Web 进程内的后台线程，补齐窗口内缺向量的论文并清理窗口外向量。
+    # Milvus Lite 只允许一个进程打开，论文向量只能由 Web 进程写；默认关闭，避免本地起服务就调用付费 embedding。
+    "embedding_maintainer_enabled": _env_bool("ARXIV_OAI_EMBEDDING_MAINTAINER_ENABLED", False),
+    "embedding_maintainer_startup_delay_seconds": _env_float("ARXIV_OAI_EMBEDDING_MAINTAINER_STARTUP_DELAY_SECONDS", 120.0),
+    "embedding_maintainer_interval_seconds": _env_float("ARXIV_OAI_EMBEDDING_MAINTAINER_INTERVAL_SECONDS", 1800.0),
+    # 单轮最多生成多少篇的向量；补齐阶段触顶后短暂休息就开下一轮，把长时间补齐拆成可中断的短轮次。
+    "embedding_maintainer_max_per_round": _env_int("ARXIV_OAI_EMBEDDING_MAINTAINER_MAX_PER_ROUND", 1000),
 }
 
 VECTOR_STORE_CONFIG: Dict[str, Any] = {

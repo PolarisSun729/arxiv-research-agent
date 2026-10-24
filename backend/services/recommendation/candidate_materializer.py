@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
 
+from services.storage.paper_embedding_writes import insert_missing_paper_embeddings
 from services.user_behavior_policy import validate_weak_paper_action_type
 
 logger = logging.getLogger(__name__)
@@ -221,7 +222,8 @@ class CandidateMaterializer:
                     {"embedding": job["embedding"], "metadata": self._build_vector_metadata(job["normalized_paper"])}
                     for job in batch_jobs
                 ]
-                embedding_count = self.vector_store_service.insert_embeddings(self.collection_name, batch_insert_payload)
+                # 生成 embedding 期间维护任务可能已经写了同一篇，写入前在锁内再查一次，避免重复向量。
+                embedding_count = insert_missing_paper_embeddings(self.vector_store_service, self.collection_name, batch_insert_payload)
                 stats["batch_embedded"] = len(batch_jobs)
                 stats["batch_inserted"] = int(embedding_count)
                 for job in batch_jobs:

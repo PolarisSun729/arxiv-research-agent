@@ -2069,7 +2069,7 @@ def create_oai_embedding_handler(
     vector_store_service: Optional["VectorStoreService"] = None,
     embedding_collection_name: str = "arxiv_paper_embeddings",
 ) -> ArxivEmbeddingHandler:
-    """按 OAI 配置创建论文向量处理器，同步服务和补向量脚本共用；保留窗口取 ARXIV_OAI_EMBEDDING_RETENTION_MONTHS。"""
+    """按 OAI 配置创建论文向量处理器，供 Web 进程内的论文向量维护任务使用；保留窗口取 ARXIV_OAI_EMBEDDING_RETENTION_MONTHS。"""
     # 首页统计、普通本地检索只依赖 OAI SQLite；只有真的要做向量化时才导入 Milvus 相关依赖。
     if embedding_service is None:
         from services.embedding.embedding_service import EmbeddingService
@@ -2113,13 +2113,13 @@ class ArxivOaiSyncService:
         vector_store_service: Optional["VectorStoreService"] = None,
         embedding_collection_name: str = "arxiv_paper_embeddings",
         user_agent: str = "rag-project01-framework-oai-sync/1.0",
-        with_embeddings: bool = False,
     ):
         """初始化 OAI-PMH 同步服务及其依赖。
 
         该服务负责远端拉取、分页续传、分类过滤、落库和 embedding 写入，因此会在
         构造期统一准备网络会话、限流参数和向量化依赖。
-        with_embeddings 为 True（或注入了 embedding / 向量库服务）时，落库成功的论文会同时写入论文向量。
+        只有注入了 embedding / 向量库服务（测试用）时，落库成功的论文才会同时写入论文向量；
+        生产的每日同步不注入：Milvus Lite 只允许 Web 进程打开，论文向量由 Web 进程内的维护任务补。
         """
         self.endpoint = endpoint
         # arXiv OAI-PMH 对抓取频率较敏感，这里强制下限避免调用方误设过小间隔。
@@ -2132,7 +2132,7 @@ class ArxivOaiSyncService:
         self.xml_parser = ArxivOaiXmlParser()
         # 初始化 embedding 处理器
         self.embedding_handler = None
-        if with_embeddings or embedding_service or vector_store_service:
+        if embedding_service or vector_store_service:
             self.embedding_handler = create_oai_embedding_handler(
                 embedding_service=embedding_service,
                 vector_store_service=vector_store_service,

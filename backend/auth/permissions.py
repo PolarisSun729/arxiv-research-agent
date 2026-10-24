@@ -108,6 +108,8 @@ _register(ADMIN_ROLES, None, [
     ("GET", "/api/auth/users"), ("POST", "/api/auth/users"), ("GET", "/api/auth/users/{target_user_id}"),
     ("PATCH", "/api/auth/users/{target_user_id}"), ("PUT", "/api/auth/users/{target_user_id}/quotas"),
     ("DELETE", "/api/paper/{arxiv_id}"), ("GET", "/api/sync-status"), ("GET", "/api/agent/graph"),
+    # 唤醒 Web 进程内的论文向量维护任务，会调用付费 embedding。
+    ("POST", "/api/sync-status/embedding-maintenance/run"),
     ("GET", "/api/paper/{arxiv_id}/qa-diagnose"), ("GET", "/api/paper/{arxiv_id}/qa-trace/latest"),
     # 索引切分/解析产物查看：只读，但会展示整篇论文解析文本和本地索引结构。
     ("GET", "/api/admin/paper-indexes"), ("GET", "/api/admin/paper-indexes/{arxiv_id}"),

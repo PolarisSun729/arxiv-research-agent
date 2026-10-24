@@ -24,6 +24,7 @@ from dependencies import (
     get_agent_runtime_checkpoint_store,
     get_agent_resume_run_manager,
     get_index_job_manager,
+    get_oai_embedding_maintainer,
     normalize_service_load_mode,
     warm_up_services,
 )
@@ -34,6 +35,7 @@ from routers.arxiv_router import router as arxiv_router
 from routers.paper_router import router as paper_router
 from routers.qa_router import router as qa_router
 from routers.user_router import router as user_router
+from utils.config import ARXIV_OAI_CONFIG
 from utils.logging_utils import configure_backend_logging, info_event
 from utils.startup_report import log_startup_report
 from middleware.audit_log import AuditLogMiddleware, AuditSink
@@ -123,9 +125,21 @@ def create_app(load_mode: str | None = None) -> FastAPI:
             # 后台能力启动失败必须显式记录，Agent 后续提交会返回失败，不能静默回退到同步建索引。
             logger.exception("QA index lease worker failed to start: %s", exc)
 
+        embedding_maintainer = None
+        if ARXIV_OAI_CONFIG["embedding_maintainer_enabled"]:
+            try:
+                # 论文向量只由 Web 进程写（Milvus Lite 单进程独占），同步脚本只写 SQLite，缺的向量由它补。
+                embedding_maintainer = get_oai_embedding_maintainer()
+                embedding_maintainer.start()
+                info_event(logger, "oai_embedding_maintainer.started", startup_delay_seconds=embedding_maintainer.startup_delay_seconds)
+            except Exception as exc:
+                logger.exception("OAI embedding maintainer failed to start: %s", exc)
+
         try:
             yield
         finally:
+            if embedding_maintainer is not None:
+                embedding_maintainer.stop()
             if index_job_manager is not None:
                 index_job_manager.stop()
                 info_event(logger, "qa_index_worker.stopped", worker_id=index_job_manager.worker_id)

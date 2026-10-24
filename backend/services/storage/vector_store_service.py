@@ -1102,6 +1102,33 @@ class VectorStoreService:
             logger.error(f"Error reading paper embeddings by arxiv ids: {str(e)}")
             raise
 
+    def get_existing_paper_arxiv_ids(self, collection_name: str, arxiv_ids: List[str]) -> Set[str]:
+        """返回 arxiv_ids 中在论文级 collection 里已有向量的那部分。
+
+        只取 arxiv_id 字段、不读向量本身，供大批量探测“谁缺向量”使用；collection 不存在时返回空集合。
+        """
+        try:
+            normalized_ids = [str(arxiv_id).strip() for arxiv_id in arxiv_ids if str(arxiv_id).strip()]
+            if not normalized_ids:
+                return set()
+
+            client = self._get_client()
+            described = self._describe_existing_collection(client, collection_name)
+            if described is None:
+                return set()
+            resolved_name, field_names = described
+            if "arxiv_id" not in field_names:
+                logger.warning("Collection %s does not expose required field arxiv_id", resolved_name)
+                return set()
+
+            quoted_ids = ", ".join(f'"{arxiv_id}"' for arxiv_id in normalized_ids)
+            # 不设 limit：同一篇若有重复向量，按 id 数截断可能漏掉别的论文，导致重复生成。
+            results = client.query(collection_name=resolved_name, filter=f"arxiv_id in [{quoted_ids}]", output_fields=["arxiv_id"])
+            return {str(row.get("arxiv_id", "") or "").strip() for row in results if row.get("arxiv_id")}
+        except Exception as e:
+            logger.error(f"Error checking existing paper embeddings by arxiv ids: {str(e)}")
+            raise
+
     def delete_paper_embeddings_published_before(
         self,
         collection_name: str,
