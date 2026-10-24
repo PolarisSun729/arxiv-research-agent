@@ -90,6 +90,8 @@ class ExpansionPolicy:
     per_anchor_limit: int = 8
     summary_section_only: bool = False
     preferred_section_terms: Tuple[str, ...] = ()
+    # 这类问题的相关内容大约占全文块数的比例，用来按论文长度换算锚点数。
+    anchor_ratio: float = 0.15
 
 
 class ContextBudgetSelector:
@@ -686,15 +688,29 @@ class ContextExpansionPreparer:
         final_context_chunks: List[Dict[str, Any]],
         retrieval_index: Optional[CollectionRetrievalIndex],
         query_profile: Any,
-        anchor_limit: int,
+        anchor_max: int,
+        anchor_min: int = 1,
+        paper_share: Optional[float] = None,
+        reject_tail_ratio: float = 0.0,
     ) -> Dict[str, Any]:
-        """为 rerank 前 anchor_limit 个命中生成 anchor 与扩展候选，返回 debug 结构（含合并后的 candidate_pool）。
+        """为 rerank 前若干命中生成 anchor 与扩展候选，返回 debug 结构（含合并后的 candidate_pool）。
 
-        索引不可用时每个 anchor 只保留自身作为候选，并在 fallback_reason 中注明。
+        锚点数按论文块数与策略比例逐次计算（见 _resolve_anchor_budget）；rerank 末尾 reject_tail_ratio
+        的块不允许被结构扩展拉回。索引不可用时每个 anchor 只保留自身作为候选，并在 fallback_reason 中注明。
         """
         final_keys = {self._chunk_key(chunk) for chunk in final_context_chunks}
         original_hit_map = {self._candidate_key(chunk): chunk for chunk in reranked_chunks}
         policy = self._select_policy(query_profile)
+        anchor_budget = self._resolve_anchor_budget(
+            policy=policy,
+            retrieval_index=retrieval_index,
+            reranked_count=len(reranked_chunks),
+            anchor_max=anchor_max,
+            anchor_min=anchor_min,
+            paper_share=paper_share,
+            reject_tail_ratio=reject_tail_ratio,
+        )
+        rerank_rank_map = {self._candidate_key(chunk): rank for rank, chunk in enumerate(reranked_chunks, start=1)}
         anchors = [
             self._build_anchor(
                 chunk,
@@ -702,7 +718,7 @@ class ContextExpansionPreparer:
                 final_keys=final_keys,
                 query_profile=query_profile,
             )
-            for rank, chunk in enumerate(reranked_chunks[: max(1, anchor_limit)], start=1)
+            for rank, chunk in enumerate(reranked_chunks[: anchor_budget["anchor_limit"]], start=1)
         ]
 
         if retrieval_index is None or not retrieval_index.documents:
@@ -718,6 +734,7 @@ class ContextExpansionPreparer:
                 candidate_pool=candidate_pool,
                 policy=policy,
                 fallback_reason="retrieval_index_unavailable",
+                anchor_budget=anchor_budget,
             )
 
         # 每个 action 只处理一种结构关系，执行哪些由 policy.actions 决定；新增动作只需在此登记。
@@ -758,10 +775,103 @@ class ContextExpansionPreparer:
                         original_hit_map=original_hit_map,
                         policy=policy,
                     )
-            relations.append(self._relation_payload(anchor, list(candidate_map.values()), policy=policy))
+            kept = self._drop_rerank_rejected(
+                list(candidate_map.values()),
+                anchor=anchor,
+                rerank_rank_map=rerank_rank_map,
+                reject_after_rank=anchor_budget["reject_after_rank"],
+                blocked=anchor_budget["blocked"],
+            )
+            relations.append(self._relation_payload(anchor, kept, policy=policy))
 
         candidate_pool = self._merge_candidate_pool(relations, original_hit_map=original_hit_map)
-        return self._debug_payload(anchors, relations, candidate_pool=candidate_pool, policy=policy, fallback_reason="")
+        return self._debug_payload(
+            anchors,
+            relations,
+            candidate_pool=candidate_pool,
+            policy=policy,
+            fallback_reason="",
+            anchor_budget=anchor_budget,
+        )
+
+    def _resolve_anchor_budget(
+        self,
+        *,
+        policy: ExpansionPolicy,
+        retrieval_index: Optional[CollectionRetrievalIndex],
+        reranked_count: int,
+        anchor_max: int,
+        anchor_min: int,
+        paper_share: Optional[float],
+        reject_tail_ratio: float,
+    ) -> Dict[str, Any]:
+        """锚点数 = 论文块数 × 策略比例 × 本篇份额，四舍五入后夹在 [anchor_min, anchor_max]。
+
+        块数取检索索引里不重复的 chunk_id：向量库行数包含正文/摘要/生成问题等多条索引，会把块数放大数倍。
+        拿不到块数时退回 anchor_max（即固定上限的旧行为）。淘汰线 reject_after_rank 之后的 rerank 名次
+        视为 rerank 已判不相关，比例为 0 时不淘汰。
+        """
+        anchor_max = max(1, int(anchor_max))
+        anchor_min = min(max(1, int(anchor_min)), anchor_max)
+        share = 1.0 if paper_share is None else min(max(float(paper_share), 0.0), 1.0)
+        chunk_count = len(retrieval_index.by_chunk_id) if retrieval_index is not None else 0
+        if chunk_count > 0 and share > 0:
+            raw = chunk_count * policy.anchor_ratio * share
+            anchor_limit = min(max(int(round(raw)), anchor_min), anchor_max)
+            source = "retrieval_index"
+        else:
+            raw = None
+            anchor_limit = anchor_max
+            source = "unavailable_fallback_to_max"
+        tail_ratio = min(max(float(reject_tail_ratio or 0.0), 0.0), 1.0)
+        # 淘汰线不早于锚点数：锚点自身永远不会被当成“已淘汰”。
+        reject_after_rank = max(int(reranked_count * (1.0 - tail_ratio)), anchor_limit) if tail_ratio > 0 else reranked_count
+        return {
+            "policy": policy.name,
+            "ratio": policy.anchor_ratio,
+            "chunk_count": chunk_count,
+            "chunk_count_source": source,
+            "paper_share": share,
+            "raw": round(raw, 2) if raw is not None else None,
+            "min": anchor_min,
+            "max": anchor_max,
+            "anchor_limit": anchor_limit,
+            "reranked_count": reranked_count,
+            "reject_tail_ratio": tail_ratio,
+            "reject_after_rank": reject_after_rank,
+            "blocked": [],
+        }
+
+    def _drop_rerank_rejected(
+        self,
+        candidates: List[ExpansionCandidate],
+        *,
+        anchor: ExpansionAnchor,
+        rerank_rank_map: Dict[str, int],
+        reject_after_rank: int,
+        blocked: List[Dict[str, Any]],
+    ) -> List[ExpansionCandidate]:
+        """去掉 rerank 名次落在淘汰线之后的扩展候选，被挡的写入 blocked 供 debug 复盘。
+
+        rerank 没见过的块（没被任何一路召回）不受影响：rerank 没有否定过它们，结构扩展仍可带进来。
+        """
+        kept: List[ExpansionCandidate] = []
+        for candidate in candidates:
+            rank = rerank_rank_map.get(self._string_key(candidate.candidate_chunk_id))
+            if candidate.expansion_type == "self" or rank is None or rank <= reject_after_rank:
+                kept.append(candidate)
+                continue
+            blocked.append(
+                {
+                    "chunk_id": candidate.candidate_chunk_id,
+                    "section": candidate.section_path or candidate.section_title,
+                    "chunk_type": candidate.chunk_type,
+                    "rerank_rank": rank,
+                    "relation": candidate.expansion_type,
+                    "from_anchor_rank": anchor.original_rank,
+                }
+            )
+        return kept
 
     def _build_anchor(
         self,
@@ -1169,6 +1279,7 @@ class ContextExpansionPreparer:
         candidate_pool: List[Dict[str, Any]],
         policy: ExpansionPolicy,
         fallback_reason: str,
+        anchor_budget: Dict[str, Any],
     ) -> Dict[str, Any]:
         """组装 prepare 阶段的输出；candidate_count 为去重前总数，deduped_candidate_count 为合并后的候选池大小。"""
         candidate_count = sum(len(item.get("candidates", [])) for item in relations)
@@ -1176,6 +1287,7 @@ class ContextExpansionPreparer:
             "enabled": True,
             "mode": "prepare_only",
             "policy": asdict(policy),
+            "anchor_budget": anchor_budget,
             "anchor_count": len(anchors),
             "candidate_count": candidate_count,
             "deduped_candidate_count": len(candidate_pool),
@@ -1238,6 +1350,7 @@ class ContextExpansionPreparer:
         return {
             "method_flow": ExpansionPolicy(
                 name="method_flow",
+                anchor_ratio=0.15,
                 actions=("self", "section_header", "sibling", "section_neighbors", "parent_section"),
                 sibling_window=2,
                 section_window=2,
@@ -1247,6 +1360,7 @@ class ContextExpansionPreparer:
             ),
             "experiment_setup": ExpansionPolicy(
                 name="experiment_setup",
+                anchor_ratio=0.15,
                 actions=("self", "section_neighbors", "page_neighbors", "asset_related", "sibling"),
                 sibling_window=1,
                 section_window=2,
@@ -1258,6 +1372,7 @@ class ContextExpansionPreparer:
             ),
             "result_analysis": ExpansionPolicy(
                 name="result_analysis",
+                anchor_ratio=0.20,
                 actions=("self", "asset_related", "cited_asset_context", "section_neighbors", "sibling", "page_neighbors"),
                 sibling_window=1,
                 section_window=2,
@@ -1269,6 +1384,7 @@ class ContextExpansionPreparer:
             ),
             "figure_table": ExpansionPolicy(
                 name="figure_table",
+                anchor_ratio=0.10,
                 actions=("self", "asset_related", "cited_asset_context", "page_neighbors", "section_neighbors"),
                 sibling_window=1,
                 section_window=1,
@@ -1280,6 +1396,7 @@ class ContextExpansionPreparer:
             ),
             "paper_overview": ExpansionPolicy(
                 name="paper_overview",
+                anchor_ratio=0.10,
                 actions=("self", "section_header", "section_neighbors"),
                 sibling_window=0,
                 section_window=1,
@@ -1290,6 +1407,7 @@ class ContextExpansionPreparer:
             ),
             "limitation": ExpansionPolicy(
                 name="limitation",
+                anchor_ratio=0.10,
                 actions=("self", "section_header", "section_neighbors", "page_neighbors"),
                 sibling_window=0,
                 section_window=2,
@@ -1301,6 +1419,7 @@ class ContextExpansionPreparer:
             ),
             "default": ExpansionPolicy(
                 name="default",
+                anchor_ratio=0.15,
                 actions=("self", "sibling", "section_neighbors", "asset_related"),
                 sibling_window=1,
                 section_window=1,

@@ -546,8 +546,12 @@ ENHANCED_RETRIEVAL_CONFIG: Dict[str, Any] = {
     # 融合结果不截断，按融合顺序取前 rerank_candidate_limit 条送 rerank，其余接在尾部；
     # 三路各召回 30 条时候选最多约 90 条，默认 90 即几乎总是全量 rerank（rerank 一次请求打完，90 条约 0.9s）。
     "rerank_candidate_limit": _env_int("ENHANCED_RETRIEVAL_RERANK_CANDIDATE_LIMIT", 90),
-    # 上下文扩展只给 rerank 后前 N 条生成锚点与相邻/图表扩展候选。
+    # 上下文扩展的锚点数按「论文块数 × 扩展策略比例 × 本篇份额」逐次计算，再夹在 [min, limit] 之间；
+    # limit 是上限（拿不到块数时直接用它），min 防止短论文或多篇分摊后只剩一两个锚点。
     "context_expansion_anchor_limit": _env_int("ENHANCED_RETRIEVAL_CONTEXT_EXPANSION_ANCHOR_LIMIT", 30),
+    "context_expansion_anchor_min": _env_int("ENHANCED_RETRIEVAL_CONTEXT_EXPANSION_ANCHOR_MIN", 4),
+    # rerank 排在末尾这一比例的块被视为 rerank 已判不相关，结构扩展不能再把它们拉回上下文。
+    "context_expansion_reject_tail_ratio": float(_env_str("ENHANCED_RETRIEVAL_CONTEXT_EXPANSION_REJECT_TAIL_RATIO", "0.3")),
     "final_context_top_k": _env_int("ENHANCED_RETRIEVAL_FINAL_CONTEXT_TOP_K", 15),
     "max_final_context_top_k": _env_int("ENHANCED_RETRIEVAL_MAX_FINAL_CONTEXT_TOP_K", 30),
     "enable_context_expansion": _env_bool("ENHANCED_RETRIEVAL_ENABLE_CONTEXT_EXPANSION", True),

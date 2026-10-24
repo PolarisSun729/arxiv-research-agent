@@ -178,7 +178,14 @@ class RetrievalPipeline:
             final_context_chunks=original_final_context_top15,
             retrieval_index=collection_retrieval_index,
             query_profile=query_profile,
-            anchor_limit=runtime["context_expansion_anchor_limit"],
+            anchor_max=runtime["context_expansion_anchor_limit"],
+            anchor_min=runtime["context_expansion_anchor_min"],
+            paper_share=options.paper_share,
+            reject_tail_ratio=runtime["context_expansion_reject_tail_ratio"],
+        )
+        # 锚点数逐次按论文块数计算，debug 里展示本次实际值而不是配置上限。
+        effective_anchor_limit = (context_expansion.get("anchor_budget") or {}).get(
+            "anchor_limit", runtime["context_expansion_anchor_limit"]
         )
         final_context_top15, context_budget = self.context_budget_selector.select(
             reranked_chunks=rerank_result.reranked_results,
@@ -223,7 +230,7 @@ class RetrievalPipeline:
                     "effective_top_k": runtime["effective_top_k"],
                     "recall_candidate_limit": runtime["recall_candidate_limit"],
                     "rerank_candidate_limit": runtime["rerank_candidate_limit"],
-                    "context_expansion_anchor_limit": runtime["context_expansion_anchor_limit"],
+                    "context_expansion_anchor_limit": effective_anchor_limit,
                     "default_final_context_top_k": runtime["default_final_context_top_k"],
                     "max_final_context_top_k": runtime["max_final_context_top_k"],
                     **self._feature_flags(runtime),
@@ -449,6 +456,8 @@ class RetrievalPipeline:
             "recall_candidate_limit": self.enhanced_config["recall_candidate_limit"],
             "rerank_candidate_limit": self.enhanced_config["rerank_candidate_limit"],
             "context_expansion_anchor_limit": self.enhanced_config["context_expansion_anchor_limit"],
+            "context_expansion_anchor_min": int(self.enhanced_config.get("context_expansion_anchor_min", 4)),
+            "context_expansion_reject_tail_ratio": float(self.enhanced_config.get("context_expansion_reject_tail_ratio", 0.3)),
             "context_budget_max_chars": max(1, int(self.enhanced_config.get("context_budget_max_chars", 24000))),
             "retrieval_candidate_max_blocks": max(
                 effective_top_k,

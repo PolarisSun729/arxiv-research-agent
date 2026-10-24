@@ -87,6 +87,8 @@ def build_retrieval_debug_view(result: Dict[str, Any], *, chunk_key: Callable[[D
             **{key: rerank_debug.get(key) for key in ("enabled", "applied", "mode", "reason", "input_chunks", "output_chunks")},
             "latency_ms": _number((route_metrics.get("rerank") or {}).get("latency_ms")),
         },
+        # 锚点数的计算过程与被淘汰线挡掉的扩展候选，用来核对「为什么取了这么多锚点、谁没被拉回来」。
+        "anchor_budget": (debug.get("context_expansion") or {}).get("anchor_budget"),
         "chunks": sorted(rows.values(), key=lambda row: (_rank_or_inf(row["fused_rank"]), _rank_or_inf(row["final_rank"]))),
     }
 

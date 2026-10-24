@@ -30,6 +30,9 @@ class RetrievalOptions:
     # 检索调试页要按 chunk 对齐各路召回与各阶段名次，需要原始 chunk 而不是 debug 摘要；只在显式要求时返回。
     include_stage_chunks: Optional[bool] = None
     memory_context: Optional[Dict[str, Any]] = None
+    # 本篇论文在一次多篇问答中分到的锚点份额，取值 (0, 1]；不传按单篇处理（1.0）。
+    # 份额怎么分（平分或按相关度）由上层决定，管线只负责乘上这个数。
+    paper_share: Optional[float] = None
 
 
 @dataclass

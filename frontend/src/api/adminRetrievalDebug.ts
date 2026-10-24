@@ -125,7 +125,32 @@ export interface RetrievalDebugRun {
     output_chunks: number | null
     latency_ms: number | null
   }
+  // 锚点数计算过程；页面暂不展示，随导出 JSON 一起带出供排查。
+  anchor_budget?: AnchorBudget | null
   chunks: DebugChunkRow[]
+}
+
+export interface AnchorBudget {
+  policy: string
+  ratio: number
+  chunk_count: number
+  chunk_count_source: string
+  paper_share: number
+  raw: number | null
+  min: number
+  max: number
+  anchor_limit: number
+  reranked_count: number
+  reject_tail_ratio: number
+  reject_after_rank: number
+  blocked: Array<{
+    chunk_id: string
+    section: string
+    chunk_type: string
+    rerank_rank: number
+    relation: string
+    from_anchor_rank: number
+  }>
 }
 
 export function runRetrievalDebug(payload: RetrievalDebugRequest) {
