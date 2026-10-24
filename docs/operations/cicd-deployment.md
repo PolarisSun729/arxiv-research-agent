@@ -40,6 +40,7 @@ GitHub 构建经过检查的确切提交，服务器安装同一个发布包。�
 | [站点模板](../../deploy/nginx.conf) / [证书引导模板](../../deploy/nginx-bootstrap.conf) | 应用服务器上的 Nginx：接收线路机转来的 PROXY protocol，终止 TLS，提供前端并反代 API。 |
 | [线路机转发模板](../../deploy/nginx-relay-stream.conf) | 线路机只做四层转发，把 80/443 连同用户真实 IP 原样交给应用服务器。 |
 | [OAI 同步 service/timer](../../deploy/arxiv-oai-sync.service) / [timer](../../deploy/arxiv-oai-sync.timer) | 每日调用 `current/backend/07-arxiv-tools/sync_arxiv_oai_since_last_run.sh`，状态写入 shared。 |
+| [Milvus Lite 整理 service](../../deploy/arxiv-milvus-compact.service) / [timer](../../deploy/arxiv-milvus-compact.timer) | 每日 04:30 调用 `compact_milvus_lite.sh`：有已删除的向量要清时停服务约 1 分钟离线整理，没有就不停服务。 |
 | [发布回归测试](../../tests/deploy/test_release.py) | 离线验证归档、依赖、状态流转和持久数据边界。 |
 
 ## 1. 确认服务器与域名
@@ -226,9 +227,16 @@ sudo install -o root -g root -m 644 \
 sudo install -o root -g root -m 644 \
   /home/arxiv/bootstrap/deploy/arxiv-oai-sync.timer \
   /etc/systemd/system/arxiv-oai-sync.timer
+sudo install -o root -g root -m 644 \
+  /home/arxiv/bootstrap/deploy/arxiv-milvus-compact.service \
+  /etc/systemd/system/arxiv-milvus-compact.service
+sudo install -o root -g root -m 644 \
+  /home/arxiv/bootstrap/deploy/arxiv-milvus-compact.timer \
+  /etc/systemd/system/arxiv-milvus-compact.timer
 sudo systemctl daemon-reload
 sudo systemctl enable arxiv-agent.service
 sudo systemctl enable --now arxiv-oai-sync.timer
+sudo systemctl enable --now arxiv-milvus-compact.timer
 sudo visudo -f /etc/sudoers.d/arxiv-agent-deploy
 ```
 

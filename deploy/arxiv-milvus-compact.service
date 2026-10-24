@@ -1,0 +1,29 @@
+# Milvus Lite 离线整理任务（一次性运行的 systemd 单元），由 arxiv-milvus-compact.timer 每天触发。
+#
+# 安装方式：
+#   sudo install -o root -g root -m 644 deploy/arxiv-milvus-compact.service /etc/systemd/system/arxiv-milvus-compact.service
+# 手动立即执行一次：sudo systemctl start arxiv-milvus-compact.service
+# 查看日志：journalctl -u arxiv-milvus-compact（或 -t arxiv-milvus-compact）
+#
+# Web 进程内的 Milvus Lite 会把数据文件整份加载进内存，被删除的论文向量要合并后才真正释放；
+# Web 进程为防 OOM 限制了单次合并的大小，大文件里的删除行只能在这里离线清掉。
+# 没有要清的数据时不停服务；需要整理时会停 Web 服务约 1 分钟，整理完（无论成败）再启动。
+
+[Unit]
+Description=Milvus Lite offline compaction
+After=network-online.target arxiv-agent.service
+
+[Service]
+Type=oneshot
+# 不设 User：外壳脚本要停、启 arxiv-agent，整理本身由脚本用 runuser 切到 arxiv 用户执行。
+WorkingDirectory=/opt/arxiv-research-agent/current/backend
+# 路径前的 "-" 表示文件不存在时忽略，而不是让任务启动失败。
+EnvironmentFile=-/opt/arxiv-research-agent/shared/.env.production
+ExecStart=/opt/arxiv-research-agent/current/backend/07-arxiv-tools/compact_milvus_lite.sh
+# 正常 1–2 分钟；超时由 systemd 终止，脚本的 EXIT trap 仍会把 Web 服务拉起来。
+TimeoutStartSec=30min
+PrivateTmp=true
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=arxiv-milvus-compact
