@@ -41,9 +41,16 @@ class FakeEmbeddingService:
 class FakeVectorStore:
     def __init__(self, existing_ids: set | None = None) -> None:
         self.existing_ids = set(existing_ids or ())
+        self.probed_ids: List[str] = []
+        self.list_calls = 0
 
     def get_existing_paper_arxiv_ids(self, collection_name: str, arxiv_ids: List[str]) -> set:
+        self.probed_ids.extend(arxiv_ids)
         return {arxiv_id for arxiv_id in arxiv_ids if arxiv_id in self.existing_ids}
+
+    def list_paper_arxiv_ids(self, collection_name: str) -> set:
+        self.list_calls += 1
+        return set(self.existing_ids)
 
     def insert_embeddings(self, collection_name: str, items: List[Dict[str, Any]]) -> int:
         self.existing_ids.update(item["metadata"]["arxiv_id"] for item in items)
@@ -115,6 +122,8 @@ def test_round_fills_missing_papers_batch_by_batch_then_prunes_once_a_day() -> N
     assert embedding_service.batch_calls[0][0].startswith("Title 5")
     assert vector_store.existing_ids == {"1", "2", "3", "4", "5"}
     assert (result["scanned"], result["missing_found"], result["embeddings_written"]) == (5, 4, 4)
+    # 已有向量一轮只全量取一次；逐个按 id 探测的只有真正要写的论文（写入前防并发的复查），已有的 4 不会被探测。
+    assert vector_store.list_calls == 1 and "4" not in vector_store.probed_ids
     assert result["pruned_out_of_window"] == 5 and prune_calls == ["2026-04-27"]
     assert maintainer.get_status()["last_full_scan"]["missing_after_round"] == 0
 

@@ -1129,6 +1129,38 @@ class VectorStoreService:
             logger.error(f"Error checking existing paper embeddings by arxiv ids: {str(e)}")
             raise
 
+    def list_paper_arxiv_ids(self, collection_name: str) -> Set[str]:
+        """返回论文级 collection 里所有已有向量的 arxiv_id；collection 不存在时返回空集合。
+
+        arxiv_id 没有标量索引，按 id 列表查询每次都要筛一遍全表；维护任务每轮要探测整个窗口，
+        逐批查询的开销随向量数平方增长，一次只取 arxiv_id 全量拉取再在内存里比对要便宜得多。
+        """
+        client = self._get_client()
+        described = self._describe_existing_collection(client, collection_name)
+        if described is None:
+            return set()
+        resolved_name, field_names = described
+        if "arxiv_id" not in field_names:
+            logger.warning("Collection %s does not expose required field arxiv_id", resolved_name)
+            return set()
+        iterator = client.query_iterator(
+            collection_name=resolved_name,
+            batch_size=5000,
+            filter='arxiv_id != ""',
+            output_fields=["arxiv_id"],
+        )
+        arxiv_ids: Set[str] = set()
+        try:
+            while True:
+                rows = iterator.next()
+                if not rows:
+                    break
+                arxiv_ids.update(str(row.get("arxiv_id") or "").strip() for row in rows)
+        finally:
+            iterator.close()
+        arxiv_ids.discard("")
+        return arxiv_ids
+
     def delete_paper_embeddings_published_before(
         self,
         collection_name: str,

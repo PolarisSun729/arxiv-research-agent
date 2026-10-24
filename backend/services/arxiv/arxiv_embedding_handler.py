@@ -154,9 +154,23 @@ class ArxivEmbeddingHandler:
             logger.debug("Embedded OAI paper into vector store: %s", item["metadata"]["arxiv_id"])
         return stats
 
-    def find_papers_missing_embeddings(self, papers: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """返回在保留窗口内、有标题和摘要、但向量库里还没有向量的论文；向量库查询失败时直接抛出。"""
-        return self._exclude_embedded_papers(self._papers_in_window(self._eligible_papers(papers)))
+    def find_papers_missing_embeddings(
+        self,
+        papers: Sequence[Dict[str, Any]],
+        embedded_arxiv_ids: Optional[Set[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """返回在保留窗口内、有标题和摘要、但向量库里还没有向量的论文；向量库查询失败时直接抛出。
+
+        传入 embedded_arxiv_ids（list_embedded_arxiv_ids 的结果）时在内存里比对，不再查向量库。
+        """
+        candidates = self._papers_in_window(self._eligible_papers(papers))
+        if embedded_arxiv_ids is None:
+            return self._exclude_embedded_papers(candidates)
+        return [paper for paper in candidates if str(paper.get("arxiv_id", "") or "").strip() not in embedded_arxiv_ids]
+
+    def list_embedded_arxiv_ids(self) -> Set[str]:
+        """返回向量库里所有已有论文向量的 arxiv_id，供一次扫描大量论文时在内存里判断谁缺向量。"""
+        return self.vector_store_service.list_paper_arxiv_ids(self.embedding_collection_name)
 
     def prune_out_of_window(self, keep_arxiv_ids: Set[str], dry_run: bool = False) -> int:
         """删除首次提交早于保留窗口的论文向量，keep_arxiv_ids（用户点赞/点踩过的论文）除外；返回删除条数。"""
