@@ -16,12 +16,15 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pymilvus.exceptions import MilvusException
 
 from auth.charging import charge
 from auth.context import current_auth
 from core.errors import AppError, ErrorCode, error_response
+from core.responses import format_sse_event
 from dependencies import (
+    get_abstract_translation_service,
     get_embedding_service,
     get_current_embedding_config,
     get_oai_database_service,
@@ -335,6 +338,37 @@ async def get_paper(
     except Exception as exc:
         logger.error("Error getting paper: %s", str(exc))
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/paper/{arxiv_id}/abstract-translation/stream")
+async def stream_abstract_translation(
+    arxiv_id: str,
+    translation_service=Depends(get_abstract_translation_service),
+):
+    """把论文摘要流式翻译成中文：delta 事件逐段推送译文，done 事件携带完整译文；命中缓存时只推 done。
+
+    摘要在开流前取出，论文不存在时直接返回 404，而不是先回 200 再在流里报错。
+    """
+    abstract = translation_service.resolve_abstract(arxiv_id)
+
+    def event_stream():
+        # 同步生成器，StreamingResponse 放到线程池迭代；SSE 不经过 JSONResponse，每帧经 format_sse_event 脱敏。
+        try:
+            for event in translation_service.stream_translation(arxiv_id, abstract):
+                yield format_sse_event(event["event"], event["data"])
+        except AppError as exc:
+            yield format_sse_event("error", exc.to_payload())
+        except Exception:
+            logger.exception("Error in abstract translation stream: arxiv_id=%s", arxiv_id)
+            yield format_sse_event("error", AppError(
+                ErrorCode.UNKNOWN_ERROR, detail={"stage": "abstract_translation"}, context={"arxiv_id": arxiv_id},
+            ).to_payload())
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.delete("/paper/{arxiv_id}")

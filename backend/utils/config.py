@@ -841,6 +841,7 @@ GENERATION_CONFIG: Dict[str, Any] = {
         "general_generation": "large",  # 用于复杂自然语言输出的一般大模型生成
         "research_claim_extraction": "large",  # 研究引擎把草稿拆成可校验主张并绑定证据需求
         "research_claim_verification": "large",  # 研究引擎逐条对照引用证据核对主张
+        "abstract_translation": "small",  # 论文卡片上把英文摘要流式翻译成中文，首字时延优先
         "default": "large",  # 当无特定任务映射时的默认模型角色
     },
 }

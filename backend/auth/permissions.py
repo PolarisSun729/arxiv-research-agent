@@ -75,6 +75,8 @@ _register(ALL_ROLES, None, [
     # 本地目录读取不产生外部成本；论文详情只在回源 arXiv 时由路由内部扣减 papers 配额。
     ("GET", "/api/papers"), ("GET", "/api/papers/category/{category}"), ("GET", "/api/paper/{arxiv_id}"),
     ("GET", "/api/user/labeled-papers/{user_id}"),
+    # 摘要翻译单次成本不到一分钱且按论文共享缓存，不扣配额；下方单独归入 expensive 速率预算防刷。
+    ("POST", "/api/paper/{arxiv_id}/abstract-translation/stream"),
 ])
 # ---- 所有登录用户可用、扣 papers 配额：检索、标记偏好、推荐 ----
 _register(ALL_ROLES, "papers", [
@@ -130,6 +132,8 @@ _set_rate_category("read", [("POST", "/api/arxiv/search"), ("POST", "/api/arxiv/
 _set_rate_category("expensive", [("GET", "/api/paper/{arxiv_id}")])
 # 检索调试不扣配额，但每次都会调用模型，按高成本请求限速。
 _set_rate_category("expensive", [("POST", "/api/admin/retrieval-debug/runs")])
+# 摘要翻译未命中缓存时会调用 LLM；虽然不扣配额，也不能占用普通 write 预算被批量刷。
+_set_rate_category("expensive", [("POST", "/api/paper/{arxiv_id}/abstract-translation/stream")])
 
 
 def rate_category(method: str, route: str) -> str:

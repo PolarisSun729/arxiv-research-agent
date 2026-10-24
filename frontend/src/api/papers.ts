@@ -1422,3 +1422,45 @@ export async function qaPaperStream(
 
   throw createQaStreamError('stream_incomplete', '回答中断，请重试。', 'Stream finished without a completed result.')
 }
+
+export interface AbstractTranslationHandlers {
+  onDelta?: (text: string) => void
+  signal?: AbortSignal
+}
+
+// 摘要原文由后端按 arxivId 从库里取，前端只传 ID；返回完整译文，命中缓存时不会触发 onDelta。
+export async function streamAbstractTranslation(
+  arxivId: string,
+  handlers: AbstractTranslationHandlers = {}
+): Promise<string> {
+  const response = await apiFetch(`/paper/${encodeURIComponent(arxivId)}/abstract-translation/stream`, {
+    method: 'POST',
+    headers: { Accept: 'text/event-stream' },
+    signal: handlers.signal
+  })
+  if (!response.ok) {
+    throw await parseFetchErrorResponse(response, '摘要翻译失败，请稍后重试。')
+  }
+  if (!response.body) {
+    throw new ApiError(normalizeApiError(null, '摘要翻译中断，请重试。'))
+  }
+
+  for await (const block of readSseBlocks(response.body)) {
+    const { event, dataText } = parseSseBlock(block)
+    let data: any = null
+    try {
+      data = dataText ? JSON.parse(dataText) : null
+    } catch {
+      continue
+    }
+    if (event === 'delta' && typeof data?.text === 'string') {
+      handlers.onDelta?.(data.text)
+    } else if (event === 'error') {
+      throw new ApiError(normalizeApiError(data, '摘要翻译失败，请稍后重试。'))
+    } else if (event === 'done' && typeof data?.translation === 'string') {
+      return data.translation
+    }
+  }
+  // 没收到 done 说明流被截断，半截译文不能当作结果。
+  throw new ApiError(normalizeApiError(null, '摘要翻译中断，请重试。'))
+}

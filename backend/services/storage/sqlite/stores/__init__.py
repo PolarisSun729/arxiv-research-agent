@@ -5,6 +5,7 @@ from services.storage.sqlite.stores.agent_work import AgentWorkConflict, AgentWo
 from services.storage.sqlite.stores.approval_grants import ApprovalGrantConflict, ApprovalGrantStore
 from services.storage.sqlite.stores.interest_vectors import InterestVectorStore
 from services.storage.sqlite.stores.langgraph_checkpoints import LangGraphCheckpointStore
+from services.storage.sqlite.stores.paper_abstract_translations import PaperAbstractTranslationStore
 from services.storage.sqlite.stores.paper_catalog import PaperCatalogStore
 from services.storage.sqlite.stores.paper_chat_messages import PaperChatMessageStore
 from services.storage.sqlite.stores.paper_chat_sessions import PaperChatSessionStore
@@ -26,6 +27,7 @@ __all__ = [
     "ApprovalGrantStore",
     "InterestVectorStore",
     "LangGraphCheckpointStore",
+    "PaperAbstractTranslationStore",
     "PaperCatalogStore",
     "PaperChatMessageStore",
     "PaperChatSessionStore",
