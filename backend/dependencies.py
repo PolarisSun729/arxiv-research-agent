@@ -11,6 +11,7 @@ from utils.config import CORE_CONFIG, get_recommendation_clustering_runtime_conf
 if TYPE_CHECKING:
     # 这些类型只服务静态检查和编辑器提示；运行时仍保持懒加载，避免启动阶段实例化重型服务。
     from services.arxiv.arxiv_oai_service import ArxivOaiDatabaseService
+    from services.arxiv.oai_embedding_maintainer import OaiEmbeddingMaintainer
     from services.arxiv.arxiv_search_service import ArxivSearchService
     from services.arxiv.contracts import ArxivSearchBackend
     from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
@@ -272,6 +273,28 @@ def get_index_job_manager() -> IndexJobManager:
             error_code=code,
             error_message=message,
         ),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_oai_embedding_maintainer() -> OaiEmbeddingMaintainer:
+    """论文向量维护任务；和推荐共用 embedding / 向量库单例，Milvus Lite 在本进程只打开一次。"""
+    from services.arxiv.arxiv_oai_service import create_oai_embedding_handler, prune_out_of_window_embeddings
+    from services.arxiv.oai_embedding_maintainer import OaiEmbeddingMaintainer
+    from utils.config import ARXIV_OAI_CONFIG
+    from utils.storage_paths import ARXIV_OAI_SYNC_STATE_FILE
+
+    return OaiEmbeddingMaintainer(
+        handler_factory=lambda: create_oai_embedding_handler(
+            embedding_service=get_embedding_service(),
+            vector_store_service=get_vector_store_service(),
+        ),
+        database_service_factory=get_oai_database_service,
+        prune_out_of_window=prune_out_of_window_embeddings,
+        sync_state_file=ARXIV_OAI_SYNC_STATE_FILE,
+        startup_delay_seconds=ARXIV_OAI_CONFIG["embedding_maintainer_startup_delay_seconds"],
+        interval_seconds=ARXIV_OAI_CONFIG["embedding_maintainer_interval_seconds"],
+        max_per_round=ARXIV_OAI_CONFIG["embedding_maintainer_max_per_round"],
     )
 
 

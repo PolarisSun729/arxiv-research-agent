@@ -1,7 +1,7 @@
 """论文基础信息管理与首页看板路由（直接挂载在 /api 下，无统一前缀）。
 
 该模块负责：
-1. 首页看板：/stats 聚合统计、/sync-status 增量同步诊断（仅管理员）；
+1. 首页看板：/stats 聚合统计、/sync-status 增量同步与论文向量补齐诊断（仅管理员）、手动触发补一轮向量（仅管理员）；
 2. 论文元数据的新增（/paper POST）、查询（/paper/{arxiv_id}、/papers）、删除以及按分类筛选。
 
 其中新增论文时还会同步创建摘要向量并写入向量库，
@@ -28,6 +28,7 @@ from dependencies import (
     get_embedding_service,
     get_current_embedding_config,
     get_oai_database_service,
+    get_oai_embedding_maintainer,
     get_paper_catalog_store,
     get_paper_qa_service,
     get_recommendation_service,
@@ -35,7 +36,7 @@ from dependencies import (
     get_vector_store_service,
 )
 from services.storage.sqlite.stores.paper_catalog import paper_has_display_metadata
-from utils.config import get_default_user_id
+from utils.config import ARXIV_OAI_CONFIG, get_default_user_id
 from utils.storage_paths import ARXIV_OAI_SYNC_META_FILE, ARXIV_OAI_SYNC_STATE_FILE
 
 logger = logging.getLogger(__name__)
@@ -143,14 +144,33 @@ async def get_dashboard_stats(
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+def _get_embedding_maintenance_payload(maintainer: Any) -> Dict[str, Any]:
+    """论文向量维护任务的状态：开关、是否在跑、最近一轮与最近一次全窗口扫描的结果、清理与错误。"""
+    status = maintainer.get_status() if maintainer is not None else {}
+    return {"enabled": bool(ARXIV_OAI_CONFIG["embedding_maintainer_enabled"]), **status}
+
+
 @router.get("/sync-status")
-async def get_sync_status():
-    """返回最近一次增量同步的完整状态（含原始错误信息），仅管理员可访问，用于排查同步故障。"""
+async def get_sync_status(embedding_maintainer=Depends(get_oai_embedding_maintainer)):
+    """返回最近一次增量同步的完整状态（含原始错误信息）和论文向量补齐进度，仅管理员可访问，用于排查同步故障。"""
     try:
-        return _get_sync_status_payload()
+        return {**_get_sync_status_payload(), "embeddingMaintenance": _get_embedding_maintenance_payload(embedding_maintainer)}
     except Exception as exc:
         logger.error("Error getting sync status: %s", str(exc))
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/sync-status/embedding-maintenance/run")
+async def run_embedding_maintenance(embedding_maintainer=Depends(get_oai_embedding_maintainer)):
+    """请求论文向量维护任务立即开始下一轮（例如手动补完同步后想马上补向量），仅管理员可访问。
+
+    只唤醒 Web 进程内的常驻任务，不另起进程：Milvus Lite 只允许一个进程打开。正在跑的轮次不会被打断。
+    """
+    if not ARXIV_OAI_CONFIG["embedding_maintainer_enabled"] or embedding_maintainer is None:
+        raise HTTPException(status_code=409, detail="Embedding maintainer is disabled (ARXIV_OAI_EMBEDDING_MAINTAINER_ENABLED)")
+    if not embedding_maintainer.request_run():
+        raise HTTPException(status_code=409, detail="Embedding maintainer is not running")
+    return {"accepted": True, "embeddingMaintenance": _get_embedding_maintenance_payload(embedding_maintainer)}
 
 
 @router.post("/paper")

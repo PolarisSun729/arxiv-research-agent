@@ -189,6 +189,7 @@ def _ensure_dependency_stubs() -> None:
         lambda: None,
     )
     dependencies_module.get_index_job_manager = getattr(dependencies_module, "get_index_job_manager", lambda: None)
+    dependencies_module.get_oai_embedding_maintainer = getattr(dependencies_module, "get_oai_embedding_maintainer", lambda: None)
     # Agent 后台路由在导入期解析这些依赖；轻量单测只需要保留可覆盖的依赖入口。
     if not hasattr(dependencies_module, "RequestActor"):
         class _RequestActor:

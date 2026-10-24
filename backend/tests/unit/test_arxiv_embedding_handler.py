@@ -53,20 +53,17 @@ class FakeVectorStore:
         self.inserted: List[Dict[str, Any]] = []
         self.prune_calls: List[Dict[str, Any]] = []
 
-    def get_paper_embeddings_by_arxiv_ids(self, collection_name: str, arxiv_ids: List[str]) -> List[Dict[str, Any]]:
+    def get_existing_paper_arxiv_ids(self, collection_name: str, arxiv_ids: List[str]) -> set:
         if self.query_error is not None:
             raise self.query_error
-        return [{"arxiv_id": arxiv_id} for arxiv_id in arxiv_ids if arxiv_id in self.existing_ids]
+        return {arxiv_id for arxiv_id in arxiv_ids if arxiv_id in self.existing_ids}
 
     def insert_embeddings(self, collection_name: str, items: List[Dict[str, Any]]) -> int:
         if self.insert_error is not None:
             raise self.insert_error
         self.inserted.extend(items)
+        self.existing_ids.update(item["metadata"]["arxiv_id"] for item in items)
         return len(items)
-
-    def insert_single_embedding(self, collection_name: str, embedding: List[float], metadata: Dict[str, Any]) -> int:
-        self.inserted.append({"embedding": embedding, "metadata": metadata})
-        return len(self.inserted)
 
     def delete_paper_embeddings_published_before(self, **kwargs: Any) -> int:
         self.prune_calls.append(kwargs)
@@ -162,11 +159,11 @@ def test_papers_first_submitted_before_window_are_not_embedded() -> None:
     ]
 
     handler = _handler(embedding_service, vector_store, min_paper_date="2026-06-25")
+    assert [paper["arxiv_id"] for paper in handler.find_papers_missing_embeddings(papers)] == ["2610.00001", "2610.00002"]
     stats = handler.store_paper_embeddings_batch(papers)
 
     assert [item["metadata"]["arxiv_id"] for item in vector_store.inserted] == ["2610.00001", "2610.00002"]
     assert (stats.embeddings_attempted, stats.embeddings_skipped_out_of_window) == (2, 1)
-    assert [paper["arxiv_id"] for paper in handler.find_papers_missing_embeddings(papers)] == ["2610.00001", "2610.00002"]
 
 
 def test_prune_out_of_window_passes_cutoff_and_kept_ids_to_vector_store() -> None:
@@ -190,3 +187,18 @@ def test_prune_out_of_window_is_noop_without_window() -> None:
 
     assert _handler(FakeEmbeddingService(), vector_store).prune_out_of_window(set()) == 0
     assert vector_store.prune_calls == []
+
+
+def test_store_batch_skips_papers_written_by_someone_else_while_embedding() -> None:
+    """生成 embedding 期间推荐物化先写了同一篇：写入前要再查一次，不能写出重复向量（主键是自增 id）。"""
+    vector_store = FakeVectorStore()
+
+    class RacingEmbeddingService(FakeEmbeddingService):
+        def create_text_embeddings_with_usage(self, texts: List[str], **kwargs: Any):
+            vector_store.existing_ids.add("2610.00001")
+            return super().create_text_embeddings_with_usage(texts, **kwargs)
+
+    stats = _handler(RacingEmbeddingService(), vector_store).store_paper_embeddings_batch([_paper("2610.00001"), _paper("2610.00002")])
+
+    assert [item["metadata"]["arxiv_id"] for item in vector_store.inserted] == ["2610.00002"]
+    assert (stats.embeddings_attempted, stats.embeddings_written, stats.embeddings_skipped_existing, stats.embedding_errors) == (2, 1, 1, 0)
