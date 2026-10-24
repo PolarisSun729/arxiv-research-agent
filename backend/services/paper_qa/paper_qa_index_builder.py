@@ -57,6 +57,7 @@ from services.storage.sqlite.stores.paper_qa_index import PaperQAIndexStore
 from services.storage.vector_store_service import VectorDBConfig, VectorStoreService
 from utils.config import get_enhanced_retrieval_runtime_config
 from utils.logging_utils import info_event
+from utils.storage_paths import resolve_backend_artifact_path
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,15 @@ DATABASE_WRITE_STAGES = {
     "record_index_stage",
     "activate_index",
 }
+
+# 索引产物所在的 backend 子目录（PDF、chunk、embedding、检索索引、BM25 索引），删除索引时只允许清理这些目录内的文件。
+_QA_ARTIFACT_DIRS = (
+    "06-daily-arxiv-paper",
+    "01-loaded-docs",
+    "02-embedded-docs",
+    DEFAULT_RETRIEVAL_INDEX_ARTIFACT_DIR,
+    DEFAULT_SPARSE_INDEX_ARTIFACT_DIR,
+)
 
 # 允许随阶段进度写入 build 记录的产物字段白名单，防止把任意 kwargs 透传进数据库。
 QA_INDEX_ARTIFACT_FIELDS = {
@@ -168,25 +178,42 @@ class PaperQAIndexBuilder:
             raise RuntimeError("Failed to mark QA index build as processing")
 
     def _workspace_root(self) -> Path:
-        # QA artifact 目录（01-loaded-docs/02-retrieval-indexes 等）都落在 backend 下；清理相对路径时必须以 backend 为安全边界。
+        # QA artifact 目录（01-loaded-docs/02-retrieval-indexes 等）都落在 backend 下；相对路径以 backend 为基准解析。
         return Path(__file__).resolve().parents[2]
 
+    def _cleanup_roots(self) -> List[Path]:
+        """清理允许落入的根目录：backend 本身，加上各产物目录展开软链接后的真实位置。
+
+        生产发布时这些产物目录是指向 shared 的软链接，展开后不在 backend（发布目录）下；
+        只认 backend 会把所有产物判成越界，删除索引时一个文件都删不掉。
+        """
+        roots = [self._workspace_root().resolve()]
+        for dir_name in _QA_ARTIFACT_DIRS:
+            roots.append(resolve_backend_artifact_path(dir_name))
+        return roots
+
+    def _resolve_deletable_path(self, path_text: str) -> Optional[Path]:
+        """解析待删除路径；必须严格位于某个清理根目录之内（不能是根目录本身），否则返回 None。"""
+        path = Path(path_text)
+        if not path.is_absolute():
+            path = self._workspace_root() / path
+        resolved_path = path.resolve()
+        if any(root in resolved_path.parents for root in self._cleanup_roots()):
+            return resolved_path
+        return None
+
     def _safe_delete_file(self, file_path: Any) -> bool:
-        """删除单个 artifact 文件：相对路径以 backend 为基准，且解析后必须位于 backend 目录内。
+        """删除单个 artifact 文件：相对路径以 backend 为基准，解析后必须位于清理根目录内（见 _cleanup_roots）。
 
         返回 True 表示确实删除；路径为空/越界/不存在/不是文件时返回 False；删除时的 IO 异常会继续抛出。
         """
         path_text = str(file_path or "").strip()
         if not path_text:
             return False
-        path = Path(path_text)
-        if not path.is_absolute():
-            path = self._workspace_root() / path
         try:
-            resolved_path = path.resolve()
-            workspace_root = self._workspace_root().resolve()
-            if workspace_root not in resolved_path.parents and resolved_path != workspace_root:
-                logger.warning("Skip deleting QA artifact outside workspace: %s", resolved_path)
+            resolved_path = self._resolve_deletable_path(path_text)
+            if resolved_path is None:
+                logger.warning("Skip deleting QA artifact outside workspace: %s", path_text)
                 return False
             if not resolved_path.exists():
                 return False
@@ -200,25 +227,21 @@ class PaperQAIndexBuilder:
             raise
 
     def _safe_delete_directory(self, dir_path: Any) -> bool:
-        """递归删除 artifact 目录，安全边界与 _safe_delete_file 相同（两者的路径校验逻辑重复，可后续抽公共函数）。"""
+        """递归删除 artifact 目录，安全边界与 _safe_delete_file 相同。"""
         path_text = str(dir_path or "").strip()
         if not path_text:
             return False
-        path = Path(path_text)
-        if not path.is_absolute():
-            path = self._workspace_root() / path
         try:
-            resolved_path = path.resolve()
-            workspace_root = self._workspace_root().resolve()
-            if workspace_root not in resolved_path.parents and resolved_path != workspace_root:
-                logger.warning("Skip deleting QA artifact directory outside workspace: %s", resolved_path)
+            resolved_path = self._resolve_deletable_path(path_text)
+            if resolved_path is None:
+                logger.warning("Skip deleting QA artifact directory outside workspace: %s", path_text)
                 return False
             if not resolved_path.exists():
                 return False
             if not resolved_path.is_dir():
                 logger.warning("Skip deleting non-directory QA artifact: %s", resolved_path)
                 return False
-            # sparse index 是目录型 artifact；递归删除前只允许工作区内已解析路径，避免误删外部文件。
+            # sparse index 是目录型 artifact；递归删除前只允许清理根目录内的已解析路径，避免误删外部文件。
             shutil.rmtree(resolved_path)
             return True
         except Exception:
@@ -845,8 +868,9 @@ class PaperQAIndexBuilder:
             retrieval_index_debug=retrieval_index_debug,
             chunks=chunks,
             index_version=index_version,
-            # 显式锚定 backend，避免启动目录变化后生成位置与清理安全边界不一致。
-            output_dir=str(self._workspace_root() / DEFAULT_RETRIEVAL_INDEX_ARTIFACT_DIR),
+            # 和 chunk/embedding 文件一样记录展开软链接后的真实路径：生产上该目录链接到 shared，
+            # 若记成 releases/<版本>/backend/... ，旧发布目录被清理后路径就失效了。
+            output_dir=str(resolve_backend_artifact_path(DEFAULT_RETRIEVAL_INDEX_ARTIFACT_DIR)),
         )
         logger.debug("Retrieval index artifact saved to: %s", artifact_file)
         return artifact_file
@@ -918,8 +942,8 @@ class PaperQAIndexBuilder:
             source_file=chunk_file,
             source_hash=source_hash,
             backend="internal_bm25",
-            # sparse artifact 与 retrieval artifact 使用同一稳定根目录，保证版本清理可定位。
-            output_dir=str(self._workspace_root() / DEFAULT_SPARSE_INDEX_ARTIFACT_DIR),
+            # sparse artifact 与 retrieval artifact 使用同一稳定根目录（展开软链接后的真实路径），保证跨发布可读、版本清理可定位。
+            output_dir=str(resolve_backend_artifact_path(DEFAULT_SPARSE_INDEX_ARTIFACT_DIR)),
         )
         logger.debug(
             "Chunk-level sparse index artifact saved to: %s document_count=%s token_count=%s source_hash=%s",
