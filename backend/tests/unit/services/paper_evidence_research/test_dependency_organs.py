@@ -425,7 +425,7 @@ class TestLlmDecisionPolicy:
         assert state["evidence_pool_capacity"] == 1
         assert state["need_evidence"][0]["candidate_ids"] == ["54"]
         assert "previews" not in service.prompts[0]
-        assert '"evidence_pool_full" is true' in service.prompts[0]
+        assert "Not possible when retrievals_remaining is 0 or evidence_pool_full is true." in service.prompts[0]
 
     def test_prompt_contains_full_text_of_every_retrieved_candidate(self) -> None:
         # 回归 0a82ae71：决策器只看到每条 160 字摘要，把方法章节判成"无对题证据"后弃答。

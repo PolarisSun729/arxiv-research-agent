@@ -37,13 +37,13 @@ const chunks = [
   row('d', { final_rank: 2, context_role: 'neighbor' })
 ]
 const run = {
-  config: { rrf_candidate_limit: 3, effective_top_k: 2 },
+  config: { rerank_candidate_limit: 3, effective_top_k: 2 },
   rerank: { applied: true },
   chunks
 }
 
 // 每个 chunk 按最早把它挡掉的阶段归因；只出现在最终上下文的是扩展补入。
-assert.deepEqual(chunks.map(item => chunkOutcome(item, run).code), ['final', 'rerank_dropped', 'fusion_cut', 'expansion'])
+assert.deepEqual(chunks.map(item => chunkOutcome(item, run).code), ['final', 'rerank_dropped', 'rerank_cut', 'expansion'])
 // rerank 没生效时，融合保留内但没进输出的不归给 rerank。
 assert.equal(chunkOutcome(chunks[1], { ...run, rerank: { applied: false } }).code, 'not_selected')
 // 融合名次在保留线以外却出现在输出里，是扩展按锚点补进来的，不算融合保留。
@@ -70,7 +70,7 @@ const request = { arxiv_id: 'hep-th/9901001', question: 'q', enable_llm_rerank: 
 const exported = buildDebugExport(run, request, exportedAt)
 assert.equal(exported.exported_at, '2026-10-22T08:09:10.000Z')
 assert.equal(exported.request, request)
-assert.deepEqual(exported.run.chunks.map(item => item.outcome), ['final', 'rerank_dropped', 'fusion_cut', 'expansion'])
+assert.deepEqual(exported.run.chunks.map(item => item.outcome), ['final', 'rerank_dropped', 'rerank_cut', 'expansion'])
 assert.equal(exported.run.chunks[0].outcome_label, '进入检索输出')
 assert.equal('outcome' in chunks[0], false)
 // 旧式编号里的斜杠不能进文件名。
