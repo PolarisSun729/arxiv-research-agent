@@ -645,12 +645,9 @@ export interface CreateQaIndexResult {
   document_markdown_length?: number
 }
 
-export async function createPaperQaIndex(arxivId: string, loadingMethod: string = 'pymupdf'): Promise<CreateQaIndexResult> {
-  return request.post(`/paper/${arxivId}/create-qa-index`, null, {
-    params: {
-      loading_method: loadingMethod
-    }
-  })
+// PDF 只用 Docling 解析，loading_method 交给后端默认值。
+export async function createPaperQaIndex(arxivId: string): Promise<CreateQaIndexResult> {
+  return request.post(`/paper/${arxivId}/create-qa-index`)
 }
 
 export interface QaIndexJobResult {
@@ -893,9 +890,8 @@ export interface RetrievalDebugQueryCandidate {
 export interface RetrievalDebugQueryRewrite {
   enabled?: boolean
   original_query?: string
-  query_plan?: Record<string, any>
+  rewrite_status?: string
   model_queries?: string[]
-  heuristic_queries?: string[]
   selected_queries?: string[]
   selected_keywords?: string[]
   selected_query_details?: RetrievalDebugQueryDetail[]
@@ -905,9 +901,14 @@ export interface RetrievalDebugQueryRewrite {
 
 export interface RetrievalDebugHyde {
   enabled?: boolean
+  // HyDE 只用原问生成
+  input_query?: string
   text?: string
-  source_queries?: string[]
-  focus_queries?: string[]
+  // ok / error / invalid_output（含中文）/ disabled；非 ok 时 text 为空、HyDE 路由跳过
+  status?: string
+  error?: string
+  latency_ms?: number
+  confidence?: number
 }
 
 export interface RetrievalDebugKeywordSearch {
@@ -949,7 +950,6 @@ export interface RetrievalDebug {
   contextualized_question?: string
   rewritten_queries: string[]
   hyde_text: string
-  query_plan?: Record<string, any>
   query_rewrite?: RetrievalDebugQueryRewrite
   hyde?: RetrievalDebugHyde
   keyword_search?: RetrievalDebugKeywordSearch

@@ -236,6 +236,45 @@ class StorageContainerSqliteTests(unittest.TestCase):
         self.assertEqual(qa_index["current_stage"], "save_embeddings")
         self.assertEqual(qa_index["indexed_at"], "2024-01-01T00:00:00")
 
+    def test_list_paper_qa_indexes_joins_title_and_filters(self) -> None:
+        self._add_sample_paper("2401.00011")
+        store = self.storage.paper_qa_index
+        self.assertTrue(store.insert_paper_qa_index("2401.00011", status="indexed", chunk_count=7, chunking_strategy="docling_sections"))
+        self.assertTrue(store.insert_paper_qa_index("2401.00012", status="failed"))
+        # 构建成功前主表状态不变（首次是 not_indexed，删除后重建是 deleted），列表按最近一个版本改报 building / build_failed。
+        failed_build = store.create_paper_qa_index_build("2401.00013", "docling")
+        self.assertTrue(store.update_paper_qa_index_build(failed_build["build_id"], status="build_failed"))
+        store.create_paper_qa_index_build("2401.00014", "docling")
+        self.assertTrue(store.insert_paper_qa_index("2401.00016", status="deleted"))
+        rebuild = store.create_paper_qa_index_build("2401.00016", "docling")
+        self.assertTrue(store.update_paper_qa_index_build(rebuild["build_id"], status="build_failed"))
+        # 已删除且没有重建的索引不再列出。
+        self.assertTrue(store.insert_paper_qa_index("2401.00015", status="deleted"))
+
+        items, total = store.list_paper_qa_indexes()
+        self.assertEqual(total, 5)
+        by_id = {item["arxiv_id"]: item for item in items}
+        self.assertNotIn("2401.00015", by_id)
+        self.assertEqual(by_id["2401.00011"]["title"], "Paper 2401.00011")
+        self.assertEqual(by_id["2401.00011"]["chunk_count"], 7)
+        # 论文库里没有的论文仍要列出，只是没有标题。
+        self.assertIsNone(by_id["2401.00012"]["title"])
+        self.assertEqual(by_id["2401.00013"]["status"], "build_failed")
+        self.assertEqual(by_id["2401.00014"]["status"], "building")
+        self.assertEqual(by_id["2401.00016"]["status"], "build_failed")
+
+        items, total = store.list_paper_qa_indexes(query="Paper 2401")
+        self.assertEqual([item["arxiv_id"] for item in items], ["2401.00011"])
+        items, total = store.list_paper_qa_indexes(status="failed")
+        self.assertEqual((total, items[0]["arxiv_id"]), (1, "2401.00012"))
+        items, total = store.list_paper_qa_indexes(status="build_failed")
+        self.assertEqual(sorted(item["arxiv_id"] for item in items), ["2401.00013", "2401.00016"])
+        items, total = store.list_paper_qa_indexes(status="building")
+        self.assertEqual((total, items[0]["arxiv_id"]), (1, "2401.00014"))
+        self.assertEqual(store.list_paper_qa_indexes(status="deleted"), ([], 0))
+        items, total = store.list_paper_qa_indexes(offset=1, limit=1)
+        self.assertEqual((total, len(items)), (5, 1))
+
     def test_paper_qa_index_build_activation_keeps_single_active_version(self) -> None:
         arxiv_id = "2401.01000"
         self.assertTrue(

@@ -15,12 +15,43 @@ class QueryPlannerTests(unittest.TestCase):
             enable_query_rewrite=enable_query_rewrite,
         )
 
+    def test_original_question_translation_is_attached_to_query_views(self) -> None:
+        self.planner.generation_service.translate_query_for_retrieval = lambda query, **_kwargs: "  What is the   method? "
+
+        translation = self._build_bundle("这篇论文的方法是什么？")["query_views"]["original_translation"]
+
+        self.assertEqual(translation["query"], "What is the method?")
+        self.assertEqual(translation["status"], "ok")
+
+    def test_translation_failure_falls_back_to_original_question(self) -> None:
+        def fail(_query, **_kwargs):
+            raise TimeoutError("llm timeout")
+
+        self.planner.generation_service.translate_query_for_retrieval = fail
+        question = "这篇论文的方法是什么？"
+
+        translation = self._build_bundle(question)["query_views"]["original_translation"]
+
+        self.assertEqual(translation["query"], question)
+        self.assertEqual(translation["status"], "error")
+        self.assertIn("llm timeout", translation["error"])
+
+    def test_query_profile_keywords_come_from_english_translation(self) -> None:
+        self.planner.generation_service.translate_query_for_retrieval = (
+            lambda query, **_kwargs: "Which datasets are evaluated?"
+        )
+
+        profile = self._build_bundle("这篇论文用了哪些数据集？")["query_profile"]
+
+        self.assertEqual(profile.retrieval_query, "Which datasets are evaluated?")
+        self.assertEqual(profile.keywords, ["dataset", "evalu"])
+        self.assertEqual(profile.language, "zh")
+
     def test_method_question_builds_method_flow_profile(self) -> None:
         bundle = self._build_bundle("What is the method flow and architecture of the paper?")
         profile = bundle["query_profile"]
 
         self.assertEqual(profile.intent_profile.main_intent, "method_flow")
-        self.assertIn("method", profile.semantic_query)
         self.assertTrue(bundle["query_views"]["selected_queries"])
 
     def test_experiment_question_builds_experiment_profile(self) -> None:
@@ -66,35 +97,81 @@ class QueryPlannerTests(unittest.TestCase):
         self.assertTrue(any(token in profile.tokens for token in ["这篇", "分别说明", "什么"]))
         self.assertTrue(bundle["query_views"]["selected_queries"])
 
-    def test_query_rewrite_toggle_changes_selected_query_sources(self) -> None:
-        enabled = self._build_bundle("What is the method of the paper?", enable_query_rewrite=True)
-        disabled = self._build_bundle("What is the method of the paper?", enable_query_rewrite=False)
+    def test_rewrite_disabled_skips_llm_call(self) -> None:
+        views = self._build_bundle("What is the method of the paper?", enable_query_rewrite=False)["query_views"]
 
-        enabled_sources = {row["source"] for row in enabled["query_views"]["candidates"]}
-        disabled_sources = {row["source"] for row in disabled["query_views"]["candidates"]}
+        self.assertFalse(views["enabled"])
+        self.assertEqual(views["rewrite_status"], "disabled")
+        self.assertEqual(views["selected_queries"], [])
+        rewrite_calls = [
+            call for call in self.planner.generation_service.calls if call["method"] == "rewrite_query_for_retrieval"
+        ]
+        self.assertEqual(rewrite_calls, [])
 
-        self.assertIn("heuristic", enabled_sources)
-        self.assertNotIn("heuristic", disabled_sources)
-        self.assertTrue(enabled["query_views"]["enabled"])
-        self.assertFalse(disabled["query_views"]["enabled"])
+    def test_rewrite_gets_paper_context_and_keeps_llm_queries(self) -> None:
+        captured = {}
 
-    def test_query_bundle_keeps_main_intent_only_in_intent_profile(self) -> None:
-        self.planner.generation_service.plan_queries_for_retrieval = lambda **_kwargs: {
-            "question_type": "method",
-            "main_intent": "method",
-            "sub_intents": ["deep_method"],
-            "paper_terms": ["retrieval"],
-            "preferred_sections": ["method"],
-            "rewrite_queries": [{"query": "retrieval method pipeline"}],
-        }
+        def rewrite(query, **kwargs):
+            captured.update(kwargs)
+            return ["How does the sparse projection method work?", "Which datasets are evaluated?"]
+
+        self.planner.generation_service.rewrite_query_for_retrieval = rewrite
+        views = self._build_bundle("这个方法怎么做的，用了哪些数据集？")["query_views"]
+
+        self.assertEqual(views["rewrite_status"], "ok")
+        self.assertEqual(
+            views["selected_queries"],
+            ["How does the sparse projection method work?", "Which datasets are evaluated?"],
+        )
+        self.assertEqual(set(captured["paper_context"]), {"title", "abstract", "section_titles"})
+
+    def test_rewrite_failure_leaves_route_without_queries(self) -> None:
+        def fail(_query, **_kwargs):
+            raise ValueError("bad json")
+
+        self.planner.generation_service.rewrite_query_for_retrieval = fail
+        views = self._build_bundle("这个方法怎么做的？")["query_views"]
+
+        self.assertEqual(views["rewrite_status"], "error")
+        self.assertIn("bad json", views["llm_error"])
+        self.assertEqual(views["selected_queries"], [])
+
+    def test_chinese_rewrite_is_dropped_as_invalid_output(self) -> None:
+        self.planner.generation_service.rewrite_query_for_retrieval = lambda _query, **_kwargs: ["这个方法怎么做的？"]
+        views = self._build_bundle("这个方法怎么做的？")["query_views"]
+
+        self.assertEqual(views["selected_queries"], [])
+        self.assertEqual(views["candidates"][0]["reason"], "not_english")
+        self.assertEqual(views["rewrite_status"], "invalid_output")
+
+    def test_rewrite_same_as_translation_or_duplicate_is_dropped(self) -> None:
+        self.planner.generation_service.translate_query_for_retrieval = lambda _query, **_kwargs: "What is the method?"
+        self.planner.generation_service.rewrite_query_for_retrieval = lambda _query, **_kwargs: [
+            "what is the  method?",
+            "Which datasets are used?",
+            "which datasets are used?",
+        ]
+        views = self._build_bundle("方法是什么，用了哪些数据集？")["query_views"]
+
+        self.assertEqual(views["selected_queries"], ["Which datasets are used?"])
+        self.assertEqual(
+            [row["reason"] for row in views["candidates"]],
+            ["same_as_original", "kept", "duplicate"],
+        )
+
+    def test_rewrite_fully_covered_by_translation_reports_status(self) -> None:
+        self.planner.generation_service.translate_query_for_retrieval = lambda _query, **_kwargs: "What is the method?"
+        self.planner.generation_service.rewrite_query_for_retrieval = lambda _query, **_kwargs: ["What is the method?"]
+        views = self._build_bundle("方法是什么？")["query_views"]
+
+        self.assertEqual(views["selected_queries"], [])
+        self.assertEqual(views["rewrite_status"], "covered_by_original")
+
+    def test_section_preferences_come_from_intent_only(self) -> None:
         bundle = self._build_bundle("How does the method pipeline work?")
         profile = bundle["query_profile"]
 
-        self.assertEqual(profile.intent_profile.main_intent, "method_flow")
-        self.assertFalse(hasattr(profile, "question_type"))
-        self.assertNotIn("question_type", profile.query_plan)
-        self.assertNotIn("main_intent", profile.query_plan)
-        self.assertNotIn("sub_intents", profile.query_plan)
+        self.assertEqual(profile.section_preferences, list(profile.intent_profile.preferred_sections))
 
 
 if __name__ == "__main__":

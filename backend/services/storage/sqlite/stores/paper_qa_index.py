@@ -338,6 +338,65 @@ class PaperQAIndexStore(BaseSqliteStore):
             logger.error(f"Error listing paper QA index builds: {str(e)}")
             return []
 
+    def list_paper_qa_indexes(
+        self,
+        *,
+        query: str = "",
+        status: str = "",
+        offset: int = 0,
+        limit: int = 50,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """管理端分页列出所有论文的索引主表记录，附带论文标题和版本数；query 同时匹配 arxiv_id 与标题。
+
+        返回的 status 是给管理员看的状态，status 过滤也按它：主表在构建成功前不会变（首次构建是 not_indexed，
+        删除后重建是 deleted），所以这两种情况按最近一个版本改报 building / build_failed。
+        已删除且没有在重建的索引不再列出：删除流程已清掉它的 chunk 文件，没有可看的内容。
+        """
+        where_parts: List[str] = []
+        values: List[Any] = []
+        normalized_query = str(query or "").strip()
+        if normalized_query:
+            where_parts.append("(i.arxiv_id LIKE ? OR p.title LIKE ?)")
+            values.extend([f"%{normalized_query}%"] * 2)
+        latest_build_status_sql = (
+            "(SELECT v.status FROM paper_qa_index_versions v WHERE v.arxiv_id = i.arxiv_id "
+            "ORDER BY v.created_at DESC, v.rowid DESC LIMIT 1)"
+        )
+        status_sql = (
+            f"CASE WHEN i.status IN ('not_indexed', 'deleted') AND {latest_build_status_sql} IN ('building', 'build_failed') "
+            f"THEN {latest_build_status_sql} ELSE i.status END"
+        )
+        where_parts.append(f"{status_sql} != 'deleted'")
+        if status:
+            where_parts.append(f"{status_sql} = ?")
+            values.append(status)
+        where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        from_sql = "FROM paper_qa_index i LEFT JOIN arxiv_papers p ON p.arxiv_id = i.arxiv_id"
+        columns = (
+            "arxiv_id", "title", "status", "chunk_count", "loading_method", "chunking_strategy",
+            "active_build_id", "indexed_at", "updated_at", "build_count",
+        )
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(f"SELECT COUNT(*) {from_sql} {where_sql}", values)
+                total = int(cursor.fetchone()[0] or 0)
+                cursor.execute(
+                    f"""
+                    SELECT i.arxiv_id, p.title, {status_sql}, i.chunk_count, i.loading_method, i.chunking_strategy,
+                           i.active_build_id, i.indexed_at, i.updated_at,
+                           (SELECT COUNT(*) FROM paper_qa_index_versions v WHERE v.arxiv_id = i.arxiv_id)
+                    {from_sql} {where_sql}
+                    ORDER BY i.updated_at DESC, i.arxiv_id
+                    LIMIT ? OFFSET ?
+                    """,
+                    [*values, max(1, int(limit)), max(0, int(offset))],
+                )
+                return [dict(zip(columns, row)) for row in cursor.fetchall()], total
+        except Exception as e:
+            logger.error(f"Error listing paper QA indexes: {str(e)}")
+            return [], 0
+
     def update_paper_qa_index_build(self, build_id: str, **kwargs) -> bool:
         """按白名单字段部分更新某个构建版本；只改版本表，不影响主表的 active 指针。"""
         try:

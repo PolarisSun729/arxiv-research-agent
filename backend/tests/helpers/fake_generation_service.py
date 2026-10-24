@@ -30,15 +30,8 @@ class FakeGenerationService:
 
     def rewrite_query_for_retrieval(self, query: str, **kwargs: Any) -> list[str]:
         self._record("rewrite_query_for_retrieval", query=query, kwargs=kwargs)
-        return [query]
-
-    def plan_queries_for_retrieval(self, query: str, **kwargs: Any) -> dict[str, Any]:
-        self._record("plan_queries_for_retrieval", query=query, kwargs=kwargs)
-        return {
-            "query": query,
-            "rewrites": [query],
-            "strategy": "fake",
-        }
+        # 改写要求输出英文问句，固定返回一条英文问句，避免中文问题的回显被当成不合格输出丢弃。
+        return ["Which passage of the paper answers this question?"]
 
     def build_rerank_query(self, query: str, **kwargs: Any) -> str:
         self._record("build_rerank_query", query=query, kwargs=kwargs)
@@ -47,6 +40,10 @@ class FakeGenerationService:
     def generate_hyde_document(self, query: str, **kwargs: Any) -> str:
         self._record("generate_hyde_document", query=query, kwargs=kwargs)
         return f"HyDE: {query}"
+
+    def translate_query_for_retrieval(self, query: str, **kwargs: Any) -> str:
+        self._record("translate_query_for_retrieval", query=query, kwargs=kwargs)
+        return query
 
     def compress_chunks_for_rerank(self, chunks: Iterable[dict[str, Any]], **kwargs: Any) -> list[dict[str, Any]]:
         normalized_chunks = [dict(chunk) for chunk in chunks]

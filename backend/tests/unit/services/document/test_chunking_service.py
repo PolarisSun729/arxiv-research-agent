@@ -139,5 +139,76 @@ class ChunkingServiceAssetSectionTests(unittest.TestCase):
         self.assertIn("2 Results", high_chunk["content"])
 
 
+class ChunkingServiceDoclingNoiseTests(unittest.TestCase):
+    def test_page_header_and_footer_are_dropped_from_docling_items(self) -> None:
+        # 字段值取自真实 Docling 输出：文档对象导出的层是 "ContentLayer.FURNITURE"，原始 JSON 里是 "furniture"。
+        items = [
+            {"text": "Private RAG via Random Projection", "label": "page_header", "content_layer": "ContentLayer.FURNITURE", "role": "text", "page_start": 2, "order_index": 1},
+            {"text": "A PREPRINT", "label": "page_header", "content_layer": "ContentLayer.FURNITURE", "role": "heading", "page_start": 2, "order_index": 2},
+            {"text": "Body paragraph about the threat model and attacker capabilities.", "label": "text", "content_layer": "ContentLayer.BODY", "page_start": 2, "order_index": 3},
+            {"text": "2", "label": "page_footer", "content_layer": "furniture", "page_start": 2, "order_index": 4},
+        ]
+
+        collected = ChunkingService()._collect_docling_items({"docling_text_items": items}, [])
+
+        self.assertEqual([item["text"] for item in collected], ["Body paragraph about the threat model and attacker capabilities."])
+
+
+
+class ChunkingServiceDoclingHeadingTests(unittest.TestCase):
+    """章节标题只认 Docling 的 section_header / title 标签，不按文字长相判断。"""
+
+    def test_section_header_label_is_trusted_and_text_is_never_promoted(self) -> None:
+        items = [
+            {"text": "1. Introduction", "label": "section_header", "content_layer": "body", "page_start": 1, "order_index": 1},
+            {"text": "Offline preprocessing", "label": "text", "content_layer": "body", "page_start": 1, "order_index": 2},
+            {"text": "A.1 Hardware Infrastructure", "label": "section_header", "content_layer": "body", "page_start": 9, "order_index": 3},
+            {"text": "User query q", "label": "list_item", "content_layer": "body", "page_start": 9, "order_index": 4},
+            {"text": "Encoder", "label": "section_header", "content_layer": "body", "parent": "#/pictures/0", "page_start": 9, "order_index": 5},
+        ]
+
+        service = ChunkingService()
+        collected = service._collect_docling_items({"docling_text_items": items}, [])
+        headings = [item["text"] for item in collected if service._docling_item_is_heading(item)]
+
+        self.assertEqual(headings, ["1. Introduction", "A.1 Hardware Infrastructure"])
+
+    def test_heading_level_follows_section_numbering(self) -> None:
+        service = ChunkingService()
+        state = {"depth": 0, "appendix": False}
+        cases = [
+            ("Paper Title Before Numbered Sections", 1),
+            ("Abstract", 1),
+            ("3. The Proposed Method", 1),
+            ("3.1. Motivation", 2),
+            ("3.3.1. PARALLEL BRANCH", 3),
+            ("Stage I: Embedding Cosine Similarity", 4),  # 没编号，挂在最近编号章节下一层
+            ("A Simple Approach", 4),  # 进入附录前，单个字母不当编号
+            ("II. RELATED WORK", 1),
+            ("References", 1),
+            ("A Implementation Details", 1),
+            ("A.1 Hardware Infrastructure", 2),
+            ("Reasoning Trace:", 3),
+        ]
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(service._docling_heading_level(text, state), expected)
+
+    def test_heading_only_section_is_merged_into_next_chunk(self) -> None:
+        items = [
+            {"text": "4 Experiments", "label": "section_header", "content_layer": "body", "page_start": 3, "order_index": 1},
+            {"text": "4.1 Setup", "label": "section_header", "content_layer": "body", "page_start": 3, "order_index": 2},
+            {"text": "We evaluate on three multi-hop QA benchmarks.", "label": "text", "content_layer": "body", "page_start": 3, "order_index": 3},
+        ]
+
+        page_map = [{"page": 3, "text": ""}]
+        chunks = ChunkingService().chunk_docling({"docling_text_items": items}, metadata={"filename": "x.pdf"}, page_map=page_map)["chunks"]
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0]["content"], "4 Experiments\n4.1 Setup\nWe evaluate on three multi-hop QA benchmarks.")
+        self.assertEqual(chunks[0]["metadata"]["section_path"], "4 Experiments > 4.1 Setup")
+        self.assertEqual(chunks[0]["metadata"]["section_level"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

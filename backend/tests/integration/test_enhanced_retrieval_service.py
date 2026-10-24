@@ -173,9 +173,9 @@ class RetrievalPipelineIntegrationTests(unittest.TestCase):
         self.assertEqual(capped_result["debug"]["config"]["effective_top_k"], 4)
         for result in (default_result, one_result, capped_result):
             budget = result["debug"]["context_budget"]
-            reranked_count = len(result["debug"]["stages"]["reranked_top30"])
+            pool_count = len(result["debug"]["context_expansion"]["candidate_pool"])
             self.assertEqual(budget["mode"], "candidate_preselector")
-            self.assertEqual(len(result["chunks"]), min(reranked_count, budget["candidate_max_blocks"]))
+            self.assertEqual(len(result["chunks"]), min(pool_count, budget["candidate_max_blocks"]))
         debug = default_result["debug"]
         self.assertIn("raw_retrieval_top30", debug["stages"])
         self.assertIn("fused_top30", debug["stages"])

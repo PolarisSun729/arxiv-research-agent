@@ -20,6 +20,9 @@ from utils.logging_utils import info_event
 logger = logging.getLogger(__name__)
 
 # 运行期功能开关；debug 配置与 trace 选项都按这个顺序原样透传。
+# trace / debug 里融合、rerank 阶段的快照只记前 30 条，与 trace_builder 导出的条数一致。
+_TRACE_STAGE_LIMIT = 30
+
 _FEATURE_FLAG_KEYS = (
     "enable_query_rewrite",
     "enable_hyde",
@@ -146,12 +149,13 @@ class RetrievalPipeline:
 
         # 即使关闭 LLM rerank，也保留 rerank/fused top_n 作为候选池；effective_top_k 只定义原始 anchor 基线，
         # retrieval 阶段的候选数量由 candidate preselector 控制，最终 token 裁剪交给 PromptBudgetPlanner。
-        fused_limit = max(runtime["rrf_candidate_limit"], runtime["effective_top_k"])
+        # 融合不截断：融合只负责去重和排序，送多少条进 rerank 由 rerank_candidate_limit 决定。
+        fused_limit = sum(len(items) for items in routes.values())
         fusion_result = self.fusion_service.fuse(
             routes,
             fused_limit=fused_limit,
             raw_limit=runtime["recall_candidate_limit"],
-            fused_stage_limit=runtime["rrf_candidate_limit"],
+            fused_stage_limit=_TRACE_STAGE_LIMIT,
             query_profile=query_profile,
         )
         self.trace_builder.log_retrieval_stage("raw_retrieval_top30", fusion_result.raw_retrieval_top_n)
@@ -163,7 +167,6 @@ class RetrievalPipeline:
             fused_results=fusion_result.fused_results,
             effective_top_k=runtime["effective_top_k"],
             rerank_candidate_limit=runtime["rerank_candidate_limit"],
-            rrf_candidate_limit=runtime["rrf_candidate_limit"],
             query_profile=query_profile,
             original_question=user_query,
         )
@@ -175,7 +178,14 @@ class RetrievalPipeline:
             final_context_chunks=original_final_context_top15,
             retrieval_index=collection_retrieval_index,
             query_profile=query_profile,
-            anchor_limit=runtime["rrf_candidate_limit"],
+            anchor_max=runtime["context_expansion_anchor_limit"],
+            anchor_min=runtime["context_expansion_anchor_min"],
+            paper_share=options.paper_share,
+            reject_tail_ratio=runtime["context_expansion_reject_tail_ratio"],
+        )
+        # 锚点数逐次按论文块数计算，debug 里展示本次实际值而不是配置上限。
+        effective_anchor_limit = (context_expansion.get("anchor_budget") or {}).get(
+            "anchor_limit", runtime["context_expansion_anchor_limit"]
         )
         final_context_top15, context_budget = self.context_budget_selector.select(
             reranked_chunks=rerank_result.reranked_results,
@@ -209,7 +219,7 @@ class RetrievalPipeline:
                 deduped_routes=fusion_result.deduped_routes,
                 raw_retrieval_top30=fusion_result.raw_retrieval_top_n,
                 fused_top30=fusion_result.fused_top_n,
-                reranked_top30=rerank_result.reranked_results[: runtime["rrf_candidate_limit"]],
+                reranked_top30=rerank_result.reranked_results[:_TRACE_STAGE_LIMIT],
                 final_context_top15=final_context_top15,
                 final_results=final_context_top15,
                 rerank_debug=rerank_result.rerank_debug,
@@ -219,8 +229,8 @@ class RetrievalPipeline:
                     "requested_top_k": runtime["requested_top_k"],
                     "effective_top_k": runtime["effective_top_k"],
                     "recall_candidate_limit": runtime["recall_candidate_limit"],
-                    "rrf_candidate_limit": runtime["rrf_candidate_limit"],
                     "rerank_candidate_limit": runtime["rerank_candidate_limit"],
+                    "context_expansion_anchor_limit": effective_anchor_limit,
                     "default_final_context_top_k": runtime["default_final_context_top_k"],
                     "max_final_context_top_k": runtime["max_final_context_top_k"],
                     **self._feature_flags(runtime),
@@ -274,6 +284,17 @@ class RetrievalPipeline:
                 context_budget=context_budget,
             )
 
+        stage_chunks = None
+        if options.include_stage_chunks:
+            deduped_routes = fusion_result.deduped_routes
+            stage_chunks = {
+                "routes": deduped_routes,
+                # 融合不截断，正式链路的融合结果就是完整融合顺序。
+                "fused": fusion_result.fused_results,
+                "reranked": rerank_result.reranked_results,
+                "final": final_context_top15,
+            }
+
         trace_path = trace_export.get("json") if isinstance(trace_export, dict) else None
         rerank_debug = rerank_result.rerank_debug if isinstance(rerank_result.rerank_debug, dict) else {}
         context_meta = paper_context if isinstance(paper_context, dict) else {}
@@ -298,6 +319,7 @@ class RetrievalPipeline:
             chunks=final_context_top15,
             debug=debug,
             trace_export=trace_export,
+            stage_chunks=stage_chunks,
         ).to_response()
 
     def _rerank_or_passthrough(
@@ -308,7 +330,6 @@ class RetrievalPipeline:
         fused_results: list[dict[str, Any]],
         effective_top_k: int,
         rerank_candidate_limit: int,
-        rrf_candidate_limit: int,
         query_profile: Any,
         original_question: str,
     ) -> RerankResult:
@@ -388,7 +409,7 @@ class RetrievalPipeline:
                 "cache_hit": None,
                 "timeout": False,
             }
-        self.trace_builder.log_retrieval_stage("reranked_top30", reranked_results[:rrf_candidate_limit])
+        self.trace_builder.log_retrieval_stage("reranked_top30", reranked_results[:_TRACE_STAGE_LIMIT])
         self.trace_builder.log_retrieval_stage("final_context_top15", final_results[:effective_top_k])
         return RerankResult(
             final_results=final_results,
@@ -433,8 +454,10 @@ class RetrievalPipeline:
             "debug_enabled": self.option_resolver(options.debug, self.retrieval_config["debug"]),
             **{key: bool(self.enhanced_config.get(key, True)) for key in _INDEX_FEATURE_KEYS},
             "recall_candidate_limit": self.enhanced_config["recall_candidate_limit"],
-            "rrf_candidate_limit": self.enhanced_config["rrf_candidate_limit"],
             "rerank_candidate_limit": self.enhanced_config["rerank_candidate_limit"],
+            "context_expansion_anchor_limit": self.enhanced_config["context_expansion_anchor_limit"],
+            "context_expansion_anchor_min": int(self.enhanced_config.get("context_expansion_anchor_min", 4)),
+            "context_expansion_reject_tail_ratio": float(self.enhanced_config.get("context_expansion_reject_tail_ratio", 0.3)),
             "context_budget_max_chars": max(1, int(self.enhanced_config.get("context_budget_max_chars", 24000))),
             "retrieval_candidate_max_blocks": max(
                 effective_top_k,

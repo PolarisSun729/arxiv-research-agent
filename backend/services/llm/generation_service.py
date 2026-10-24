@@ -9,7 +9,7 @@ from typing import Iterator, List, Dict, Optional, Any, Tuple
 import logging
 from services.llm.call_metrics import record_llm_call, record_llm_usage
 from openai import OpenAI
-from services.intent.intent_service import EXPERIMENT_INTENTS, MAIN_INTENTS, METHOD_INTENTS, OVERVIEW_INTENTS
+from services.intent.intent_service import EXPERIMENT_INTENTS, METHOD_INTENTS, OVERVIEW_INTENTS
 from services.paper_qa.answer_language import CHINESE_FINAL_ANSWER_INSTRUCTION
 from utils.config import GENERATION_CONFIG
 from utils.storage_paths import resolve_backend_artifact_path
@@ -28,7 +28,7 @@ QWEN_LARGE_MODEL_NAME = GENERATION_CONFIG["large_qwen_model_name"]
 QWEN_RERANK_COMPRESS_MODEL_NAME = GENERATION_CONFIG["qwen_rerank_compress_model_name"]
 QWEN_RERANK_COMPRESS_ENABLE_THINKING = GENERATION_CONFIG["qwen_rerank_compress_enable_thinking"]
 REWRITE_QUERY_MAX_QUERIES_DEFAULT = GENERATION_CONFIG["rewrite_query_max_queries_default"]
-PLAN_QUERY_MAX_QUERIES_DEFAULT = GENERATION_CONFIG["plan_query_max_queries_default"]
+QUERY_REWRITE_TEMPERATURE = GENERATION_CONFIG["query_rewrite_temperature"]
 QWEN_TASK_MODEL_ROLES = dict(GENERATION_CONFIG.get("task_model_roles", {}))
 
 # DashScope Responses API 会在入站阶段按请求体字节数拒绝超大请求；这里用软限制预留
@@ -394,8 +394,12 @@ class GenerationService:
         enable_thinking: bool = QWEN_RERANK_COMPRESS_ENABLE_THINKING,
         image_inputs: Optional[List[Dict[str, Any]]] = None,
         request_debug: Optional[Dict[str, Any]] = None,
+        temperature: Optional[float] = None,
     ) -> str:
-        """单轮补全；传入 image_inputs 时把图片作为多模态输入附在 prompt 之后，prompt 原样保留不加问答模板。"""
+        """单轮补全；传入 image_inputs 时把图片作为多模态输入附在 prompt 之后，prompt 原样保留不加问答模板。
+
+        temperature 为空时使用模型服务端默认值。
+        """
         try:
             if not api_key:
                 api_key = QWEN_API_KEY
@@ -425,10 +429,12 @@ class GenerationService:
                 if request_debug is not None:
                     request_debug.update(image_debug)
             record_llm_call(model=model_name, task_type=task_type or "completion")
+            sampling = {"temperature": temperature} if temperature is not None else {}
             response = client.responses.create(
                 model=model_name,
                 input=qwen_input,
                 extra_body={"enable_thinking": enable_thinking},
+                **sampling,
             )
             record_llm_usage(getattr(response, "usage", None))
 
@@ -495,23 +501,57 @@ class GenerationService:
         api_key: Optional[str] = None,
         model_name: Optional[str] = None,
     ) -> List[str]:
-        data = self.plan_queries_for_retrieval(
-            question=question,
-            max_queries=max_queries,
-            paper_context=paper_context,
+        """把问题改写成忠实于原意的英文检索问句：只做模糊指代具体化和复合问题拆分，至少返回一条。
+
+        模型没给出任何问句时抛 ValueError，由调用方跳过改写路由；与原问译文重复的改写由调用方去重。
+        """
+        paper_context = paper_context or {}
+        title = str(paper_context.get("title", "") or "").strip()
+        abstract = str(paper_context.get("abstract", "") or "").strip()
+        section_titles = [str(item).strip() for item in (paper_context.get("section_titles", []) or []) if str(item).strip()]
+        prompt = (
+            "You rewrite a user's question about a single English research paper into retrieval queries over that paper.\n"
+            "Only two kinds of rewriting are allowed:\n"
+            "- Make vague references specific: replace words such as \"this method\" or \"the model\" with the exact names used in the paper context.\n"
+            "- Split a compound question into self-contained sub-questions, one for each thing it asks.\n"
+            "Rules:\n"
+            "1. Keep the meaning of the question. Do not answer it, and do not add aspects the question does not ask about.\n"
+            "2. Take paper terms only from the paper context below; never invent names, datasets, modules, or methods.\n"
+            "3. Write every query in English as a complete question that can be understood on its own, "
+            "even when the user's question is in Chinese or another language.\n"
+            "4. Keep symbols, variable names, formulas, and abbreviations exactly as written.\n"
+            f"5. Return 1 to {max_queries} queries.\n"
+            "6. If the question is already specific and asks about only one thing, still return one query: "
+            "the question in English, using the paper's own terms where they make it more specific.\n"
+            "7. Return JSON only, with this schema: {\"queries\": [\"...\"]}\n\n"
+            f"Question: {question}\n\n"
+            f"Paper title: {title or 'N/A'}\n"
+            f"Paper abstract: {abstract[:1800] or 'N/A'}\n"
+            f"Section titles: {', '.join(section_titles[:16]) or 'N/A'}\n\n"
+            # 语言要求放在紧挨输出的位置再说一遍：中文问题放在最后时，模型容易跟着问题的语言输出。
+            "Answer with the JSON only. Every query must be written in English; do not output any Chinese."
+        )
+        response = self.complete_with_qwen(
+            prompt,
             api_key=api_key,
             model_name=model_name,
+            task_type="query_rewrite",
+            # 保留少量随机性，但改写要贴着原问，不用服务端默认温度。
+            temperature=QUERY_REWRITE_TEMPERATURE,
         )
-        queries = data.get("rewrite_queries", [])
-        normalized_queries: List[str] = []
-        for item in queries:
-            if isinstance(item, dict):
-                query = str(item.get("query", "")).strip()
-                if query:
-                    normalized_queries.append(query)
-            elif isinstance(item, str) and item.strip():
-                normalized_queries.append(item.strip())
-        return normalized_queries
+        data = json.loads(self._extract_json_block(response))
+        # 模型偶尔省掉外层对象直接返回数组（如 "[]"），语义相同，按 queries 处理。
+        raw_queries = data.get("queries") if isinstance(data, dict) else data
+        if not isinstance(raw_queries, list):
+            raise ValueError("query rewrite response has no queries list")
+        queries: List[str] = []
+        for item in raw_queries:
+            query = " ".join(str(item or "").split())
+            if query and query not in queries:
+                queries.append(query)
+        if not queries:
+            raise ValueError("query rewrite returned no queries")
+        return queries[:max_queries]
 
     def build_rerank_query(
         self,
@@ -532,61 +572,6 @@ class GenerationService:
             )
         logger.debug("actual_rerank_query=%s", rerank_query)
         return rerank_query
-
-    def plan_queries_for_retrieval(
-        self,
-        question: str,
-        max_queries: int = PLAN_QUERY_MAX_QUERIES_DEFAULT,
-        paper_context: Optional[Dict[str, Any]] = None,
-        api_key: Optional[str] = None,
-        model_name: Optional[str] = None,
-        intent_profile: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        paper_context = paper_context or {}
-        title = str(paper_context.get("title", "") or "").strip()
-        abstract = str(paper_context.get("abstract", "") or "").strip()
-        section_titles = [str(item).strip() for item in (paper_context.get("section_titles", []) or []) if str(item).strip()]
-        candidate_terms = [str(item).strip() for item in (paper_context.get("candidate_terms", []) or []) if str(item).strip()]
-        main_intent = str((intent_profile or {}).get("main_intent", "other") or "other").strip() or "other"
-        intent_summary = str((intent_profile or {}).get("intent_summary", "") or "").strip()
-        preferred_sections = [str(item).strip() for item in (intent_profile or {}).get("preferred_sections", []) or [] if str(item).strip()]
-        sub_intents = [str(item).strip() for item in (intent_profile or {}).get("sub_intents", []) or [] if str(item).strip()]
-
-        prompt = (
-            "You are a query planner for retrieval over a single academic paper.\n"
-            "Use the provided intent profile and produce retrieval queries grounded in the paper context.\n"
-            "Rules:\n"
-            "1. Return JSON only.\n"
-            "2. Do not invent paper-specific names, datasets, modules, or methods.\n"
-            "3. Prefer terms copied from the paper title, abstract, and section titles.\n"
-            "4. Keep each query short and retrieval-friendly.\n"
-            "5. Generate 3 to 5 queries with different retrieval angles, not paraphrase duplicates.\n"
-            "6. Prefer English retrieval queries unless the paper context is clearly Chinese.\n"
-            "7. Do not classify or return another intent field.\n"
-            "8. The JSON schema must be:\n"
-            "   {\"paper_terms\": [\"...\"], \"preferred_sections\": [\"...\"], \"rewrite_queries\": [{\"query\": \"...\", \"focus\": \"...\", \"channels\": [\"vector\", \"keyword\"]}]}\n"
-            f"9. Return at most {max_queries} rewrite queries.\n\n"
-            f"10. Current intent profile: main_intent={main_intent}, intent_summary={intent_summary or 'N/A'}, sub_intents={', '.join(sub_intents) or 'N/A'}, preferred_sections={', '.join(preferred_sections) or 'N/A'}.\n\n"
-            f"User question: {question}\n\n"
-            f"Paper title: {title or 'N/A'}\n"
-            f"Paper abstract: {abstract[:1800] or 'N/A'}\n"
-            f"Section titles: {', '.join(section_titles[:16]) or 'N/A'}\n"
-            f"Candidate paper terms: {', '.join(candidate_terms[:24]) or 'N/A'}"
-        )
-        response = self.complete_with_qwen(
-            prompt,
-            api_key=api_key,
-            model_name=model_name,
-            task_type="query_planning",
-        )
-        data = json.loads(self._extract_json_block(response))
-        return self._normalize_query_plan(
-            data,
-            question,
-            max_queries=max_queries,
-            paper_context=paper_context,
-            main_intent=main_intent,
-        )
 
     def generate_hyde_document(
         self,
@@ -611,6 +596,29 @@ class GenerationService:
             task_type="hyde_generation",
         ).strip()
 
+    def translate_query_for_retrieval(
+        self,
+        question: str,
+        api_key: Optional[str] = None,
+        model_name: Optional[str] = None,
+    ) -> str:
+        """把用户问题译成英文，供原问向量路由检索英文论文正文；问题本身是英文时原样返回。"""
+        prompt = (
+            "Translate the user's question about an English research paper into English, for semantic retrieval over the paper.\n"
+            "Rules:\n"
+            "1. If the question is already in English, return it unchanged.\n"
+            "2. Translate faithfully; do not answer, expand, or add terms that are not in the question.\n"
+            "3. Keep symbols, variable names, formulas, method names, dataset names, and abbreviations exactly as written.\n"
+            "4. Output only the translated question, with no quotes or explanation.\n\n"
+            f"Question: {question}"
+        )
+        return self.complete_with_qwen(
+            prompt,
+            api_key=api_key,
+            model_name=model_name,
+            task_type="query_translation",
+        ).strip()
+
     def _build_evidence_selection_rerank_query(self, original_question: str, intent_profile: Optional[Dict[str, Any]] = None) -> str:
         normalized_question = re.sub(r"\s+", " ", (original_question or "")).strip()
         base_query = (
@@ -620,7 +628,7 @@ class GenerationService:
         )
         intent_clause = self._build_intent_rerank_clause(intent_profile)
         if normalized_question:
-            return f"{base_query}{intent_clause}Original question: {normalized_question}"
+            return f"{base_query}{intent_clause}Question: {normalized_question}"
         return f"{base_query}{intent_clause}".rstrip()
 
     def _build_intent_rerank_clause(self, intent_profile: Optional[Dict[str, Any]]) -> str:
@@ -669,137 +677,6 @@ class GenerationService:
             return plain_match.group(1)
 
         return text
-
-    def _normalize_query_plan(
-        self,
-        data: Dict[str, Any],
-        question: str,
-        max_queries: int = 5,
-        paper_context: Optional[Dict[str, Any]] = None,
-        main_intent: str = "other",
-    ) -> Dict[str, Any]:
-        paper_context = paper_context or {}
-        canonical_intent = str(main_intent or "other").strip() or "other"
-        if canonical_intent not in MAIN_INTENTS:
-            canonical_intent = "other"
-        paper_terms = [str(item).strip() for item in (data.get("paper_terms", []) or []) if str(item).strip()]
-        preferred_sections = [str(item).strip() for item in (data.get("preferred_sections", []) or []) if str(item).strip()]
-        paper_terms = list(dict.fromkeys(paper_terms))
-        preferred_sections = list(dict.fromkeys(preferred_sections))
-
-        rewrite_queries: List[Dict[str, Any]] = []
-        raw_queries = data.get("rewrite_queries")
-        if isinstance(raw_queries, list):
-            for item in raw_queries:
-                if isinstance(item, dict):
-                    query = str(item.get("query", "")).strip()
-                    if not query:
-                        continue
-                    rewrite_queries.append(
-                        {
-                            "query": query,
-                            "focus": str(item.get("focus", "")).strip(),
-                            "channels": [
-                                str(channel).strip()
-                                for channel in (item.get("channels", []) or [])
-                                if str(channel).strip()
-                            ]
-                            or ["vector", "keyword"],
-                        }
-                    )
-                elif isinstance(item, str) and item.strip():
-                    rewrite_queries.append(
-                        {
-                            "query": item.strip(),
-                            "focus": "",
-                            "channels": ["vector", "keyword"],
-                        }
-                    )
-        if len(rewrite_queries) > max_queries:
-            rewrite_queries = rewrite_queries[:max_queries]
-
-        if not rewrite_queries:
-            fallback_terms = paper_terms[:4]
-            if not fallback_terms:
-                fallback_terms = self._extract_fallback_terms(
-                    " ".join(
-                        [
-                            str(paper_context.get("title", "") or ""),
-                            str(paper_context.get("abstract", "") or ""),
-                            " ".join(paper_context.get("section_titles", []) or []),
-                            question,
-                        ]
-                    )
-                )
-            fallback_query = " ".join(fallback_terms[:6]).strip() or question.strip()
-            rewrite_queries = [
-                {
-                    "query": fallback_query,
-                    "focus": "semantic",
-                    "channels": ["vector", "keyword"],
-                }
-            ]
-        elif len(rewrite_queries) < 3:
-            fallback_terms = paper_terms[:4]
-            if not fallback_terms:
-                fallback_terms = self._extract_fallback_terms(
-                    " ".join(
-                        [
-                            str(paper_context.get("title", "") or ""),
-                            str(paper_context.get("abstract", "") or ""),
-                            " ".join(paper_context.get("section_titles", []) or []),
-                            question,
-                        ]
-                    )
-                )
-
-            def build_extra_query(extra_focus: str, focus_label: str) -> Dict[str, Any]:
-                query = " ".join([*fallback_terms[:4], extra_focus]).strip() or question.strip()
-                return {"query": query, "focus": focus_label, "channels": ["vector", "keyword"]}
-
-            fillers: List[Dict[str, Any]] = []
-            # Query planner 只消费入口已经确认的正式 intent，避免再次分类产生第二套 schema。
-            if canonical_intent in {"method_flow", "implementation_detail", "definition"}:
-                fillers = [
-                    build_extra_query("method framework algorithm", "method"),
-                    build_extra_query("training inference architecture", "implementation"),
-                ]
-            elif canonical_intent == "experiment_setup":
-                fillers = [
-                    build_extra_query("experiment dataset baseline", "setup"),
-                    build_extra_query("evaluation metric implementation", "evaluation"),
-                ]
-            elif canonical_intent == "result_analysis":
-                fillers = [
-                    build_extra_query("results performance comparison", "results"),
-                    build_extra_query("ablation analysis effect", "analysis"),
-                ]
-            else:
-                fillers = [
-                    build_extra_query("paper summary overview", "overview"),
-                    build_extra_query("section evidence key findings", "evidence"),
-                ]
-
-            for item in fillers:
-                if len(rewrite_queries) >= 3 or len(rewrite_queries) >= max_queries:
-                    break
-                if item["query"] not in {str(entry.get("query", "")) for entry in rewrite_queries if isinstance(entry, dict)}:
-                    rewrite_queries.append(item)
-
-        return {
-            "paper_terms": paper_terms,
-            "preferred_sections": preferred_sections,
-            "rewrite_queries": rewrite_queries,
-        }
-
-    def _extract_fallback_terms(self, text: str, limit: int = 8) -> List[str]:
-        tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9_\-]{1,}|[\u4e00-\u9fff]{2,}", text or "")
-        seen: List[str] = []
-        for token in tokens:
-            token = token.strip()
-            if token and token not in seen:
-                seen.append(token)
-        return seen[:limit]
 
     def _build_rerank_chunk_compression_prompt(
         self,

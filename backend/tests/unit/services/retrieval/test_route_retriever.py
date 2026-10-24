@@ -118,6 +118,34 @@ class RouteRetrieverTests(unittest.TestCase):
         self.assertFalse(disabled["hyde_debug"]["enabled"])
         self.assertEqual(disabled["routes"]["vector_hyde"], [])
 
+    def test_hyde_failure_skips_route_without_template_fallback(self) -> None:
+        def fail(query, **kwargs):
+            raise RuntimeError("llm down")
+
+        self.service.route_retriever.generation_service.generate_hyde_document = fail
+        bundle = self._build_route_bundle("Explain the paper method.", enable_hyde=True)
+
+        self.assertEqual(bundle["hyde_text"], "")
+        self.assertEqual(bundle["hyde_debug"]["status"], "error")
+        self.assertEqual(bundle["routes"]["vector_hyde"], [])
+        self.assertEqual(bundle["route_metrics"]["vector_hyde"]["fallback_reason"], "error")
+        self.assertIn("llm down", bundle["route_metrics"]["vector_hyde"]["error"])
+
+    def test_hyde_rejects_chinese_output(self) -> None:
+        self.service.route_retriever.generation_service.generate_hyde_document = lambda query, **kwargs: "本文提出了一种方法。"
+        bundle = self._build_route_bundle("Explain the paper method.", enable_hyde=True)
+
+        self.assertEqual(bundle["hyde_text"], "")
+        self.assertEqual(bundle["hyde_debug"]["status"], "invalid_output")
+        self.assertEqual(bundle["routes"]["vector_hyde"], [])
+        self.assertEqual(bundle["route_metrics"]["vector_hyde"]["fallback_reason"], "invalid_output")
+
+    def test_hyde_debug_uses_original_question_only(self) -> None:
+        bundle = self._build_route_bundle("Explain the paper method.", enable_hyde=True)
+
+        self.assertEqual(bundle["hyde_debug"]["input_query"], "Explain the paper method.")
+        self.assertNotIn("focus_queries", bundle["hyde_debug"])
+
     def test_keyword_toggle_controls_keyword_route(self) -> None:
         enabled = self._build_route_bundle("Which dataset benchmark is used?", enable_keyword_search=True)
         disabled = self._build_route_bundle("Which dataset benchmark is used?", enable_keyword_search=False)
@@ -145,29 +173,45 @@ class RouteRetrieverTests(unittest.TestCase):
         self.assertEqual(figure_hit["chunk_type"], "figure")
         self.assertTrue(figure_hit["keyword_hit_asset_field"])
 
-    def test_keyword_route_expands_chinese_method_query_and_reports_fields(self) -> None:
-        bundle = self._build_route_bundle("这篇论文的方法流程是怎样的？", enable_hyde=False)
+    def test_keyword_route_matches_chinese_query_via_english_translation(self) -> None:
+        self.service.query_planner.generation_service.translate_query_for_retrieval = (
+            lambda query, **kwargs: "What is the method pipeline of this paper?"
+        )
+        bundle = self._build_route_bundle("这篇论文的方法流程是怎样的？", enable_query_rewrite=False, enable_hyde=False)
         keyword_debug = bundle["keyword_debug"]
         keyword_hits = bundle["routes"]["keyword"]
 
         self.assertTrue(keyword_hits)
         self.assertEqual(keyword_hits[0]["chunk_id"], "chunk-method")
-        self.assertIn("method", keyword_debug["expanded_tokens"])
-        self.assertIn("pipeline", keyword_debug["expanded_tokens"])
+        self.assertIn("method", keyword_debug["query_tokens"])
+        self.assertIn("pipelin", keyword_debug["query_tokens"])
         self.assertIn("body", keyword_hits[0]["keyword_match_fields"])
         self.assertFalse(keyword_hits[0]["keyword_hit_asset_field"])
         self.assertEqual(keyword_debug["matched_chunks"][0]["chunk_id"], "chunk-method")
         self.assertIn("body", keyword_debug["matched_chunks"][0]["matched_fields"])
 
-    def test_keyword_route_expands_english_plural_dataset_query(self) -> None:
-        bundle = self._build_route_bundle("What datasets are used?", enable_hyde=False)
-        keyword_debug = bundle["keyword_debug"]
-        keyword_hits = bundle["routes"]["keyword"]
+    def test_keyword_original_view_uses_english_translation(self) -> None:
+        question = "这篇论文用了哪些数据集？"
+        self.service.query_planner.generation_service.translate_query_for_retrieval = (
+            lambda query, **kwargs: "Which dataset and benchmark corpus are used in this paper?"
+        )
+        bundle = self._build_route_bundle(question, enable_query_rewrite=False, enable_hyde=False)
+        original_view = bundle["keyword_debug"]["query_views"][0]
 
-        self.assertTrue(keyword_hits)
-        self.assertEqual(keyword_hits[0]["chunk_id"], "chunk-dataset")
-        self.assertIn("dataset", keyword_debug["expanded_tokens"])
-        self.assertIn("corpus", keyword_debug["expanded_tokens"])
+        self.assertEqual(original_view["source"], "original")
+        self.assertEqual(original_view["query"], "Which dataset and benchmark corpus are used in this paper?")
+        self.assertEqual(original_view["original_question"], question)
+        self.assertEqual(len(bundle["keyword_debug"]["query_views"]), 1)
+        self.assertEqual(bundle["routes"]["keyword"][0]["chunk_id"], "chunk-dataset")
+
+    def test_keyword_route_matches_plural_query_to_singular_text_by_stemming(self) -> None:
+        bundle = self._build_route_bundle("What are the datasets details?", enable_query_rewrite=False, enable_hyde=False)
+        keyword_debug = bundle["keyword_debug"]
+
+        self.assertIn("dataset", keyword_debug["query_tokens"])
+        self.assertNotIn("corpus", keyword_debug["query_tokens"])
+        self.assertNotIn("expanded_tokens", keyword_debug)
+        self.assertEqual(bundle["routes"]["keyword"][0]["chunk_id"], "chunk-dataset")
 
     def test_keyword_route_downweights_asset_chunks_for_non_figure_query(self) -> None:
         bundle = self._build_route_bundle("What is the method pipeline?", enable_hyde=False)
@@ -179,7 +223,7 @@ class RouteRetrieverTests(unittest.TestCase):
         self.assertEqual(top_asset_hits, [])
 
     def test_keyword_route_debug_contains_query_view_contributions(self) -> None:
-        bundle = self._build_route_bundle("What datasets are used?", enable_hyde=False)
+        bundle = self._build_route_bundle("Which benchmark corpus is used?", enable_hyde=False)
         keyword_debug = bundle["keyword_debug"]
         top_hit = bundle["routes"]["keyword"][0]
 
@@ -259,7 +303,6 @@ class RouteRetrieverTests(unittest.TestCase):
         )
         backend = InternalBM25Backend(
             query_tools=self.service.query_planner,
-            route_confidence_builder=self.service.retrieval_rules.route_confidence,
             structural_bonus_builder=self.service.retrieval_rules.compute_structural_bonus,
             fusion_service=self.service.fusion_service,
         )
@@ -382,7 +425,7 @@ class RouteRetrieverTests(unittest.TestCase):
         self.assertLess(dense_score, sparse_score * 1.35)
 
     def test_keyword_result_exposes_bm25_matched_terms_with_idf_and_fields(self) -> None:
-        bundle = self._build_route_bundle("Which datasets and benchmark corpus are used?", enable_hyde=False)
+        bundle = self._build_route_bundle("Which dataset and benchmark corpus are used?", enable_hyde=False)
         top_hit = bundle["routes"]["keyword"][0]
 
         self.assertEqual(top_hit["chunk_id"], "chunk-dataset")
@@ -409,43 +452,9 @@ class RouteRetrieverTests(unittest.TestCase):
         self.assertIn("matched_terms", matched)
         self.assertIn("query_sources", matched)
         self.assertIn("noise_flags", matched)
-        self.assertIn("base_route_confidence", bundle["keyword_debug"])
         term = matched["matched_terms"][0]
         self.assertIn("token", term)
         self.assertIn("idf", term)
-
-    def test_keyword_confidence_downweighted_for_overview_versus_method(self) -> None:
-        overview = self._build_route_bundle(
-            "Give an overview and summary of the paper's main contributions.",
-            enable_hyde=False,
-        )
-        method = self._build_route_bundle("What is the method pipeline and framework?", enable_hyde=False)
-
-        overview_conf = overview["routes"]["keyword"][0]["route_confidence"]
-        method_conf = method["routes"]["keyword"][0]["route_confidence"]
-        overview_base = overview["routes"]["keyword"][0]["keyword_base_route_confidence"]
-        method_base = method["routes"]["keyword"][0]["keyword_base_route_confidence"]
-
-        # overview 问题降权后 keyword confidence 应低于其自身基线，并低于 method 问题。
-        self.assertLess(overview_conf, overview_base)
-        self.assertGreaterEqual(method_conf, method_base)
-        self.assertLess(overview_conf, method_conf)
-
-    def test_keyword_confidence_drops_when_only_low_idf_token_matches(self) -> None:
-        bundle = self._build_route_bundle(
-            "Give an overview and summary of the paper's main contributions.",
-            enable_hyde=False,
-        )
-        keyword_hits = bundle["routes"]["keyword"]
-        section_only = [
-            hit
-            for hit in keyword_hits
-            if len(hit["keyword_matched_terms"]) == 1 and hit["keyword_matched_terms"][0]["idf"] < 1.2
-        ]
-        self.assertTrue(section_only, "expected at least one chunk matching only a low-idf generic token")
-        weak_hit = section_only[0]
-        full_hit = next(hit for hit in keyword_hits if len(hit["keyword_matched_terms"]) > 1)
-        self.assertLess(weak_hit["route_confidence"], full_hit["route_confidence"])
 
     def test_keyword_bm25_does_not_dominate_final_context_for_overview(self) -> None:
         result = self.service.retrieval_pipeline.retrieve(
@@ -594,7 +603,6 @@ class RouteRetrieverTests(unittest.TestCase):
             "source": "paper.pdf",
             "chunk_type": "text",
             "route_score": 0.9,
-            "route_confidence": 0.8,
             "source_query": "method",
         }
         routes = {
@@ -723,13 +731,67 @@ class RouteRetrieverTests(unittest.TestCase):
             call for call in self.service.embedding_service.calls
             if call["method"] == "create_text_embeddings_with_usage"
         ]
+        shared_calls = [call for call in embedding_calls if not call.get("instruct")]
+        original_calls = [call for call in embedding_calls if call.get("instruct")]
 
-        self.assertEqual(len(embedding_calls), 1)
+        self.assertEqual(len(shared_calls), 1)
         self.assertGreaterEqual(bundle["embedding_batch"]["batch_size"], 2)
         self.assertEqual(bundle["embedding_batch"]["status"], "ok")
-        self.assertIn(query_bundle["query_profile"].semantic_query, embedding_calls[0]["texts"])
-        self.assertIn(query_bundle["query_profile"].evidence_query, embedding_calls[0]["texts"])
+        self.assertIn(bundle["hyde_text"], shared_calls[0]["texts"])
         self.assertIn("vector_original", bundle["routes"])
+        # 原问译文和改写问句共用查询侧 instruct，单独一批。
+        self.assertEqual(len(original_calls), 1)
+        self.assertEqual(original_calls[0]["texts"], [question, *query_bundle["query_views"]["selected_queries"]])
+        self.assertEqual(bundle["embedding_batch"]["original_query_batch"]["instruct"], original_calls[0]["instruct"])
+        self.assertTrue(bundle["routes"]["vector_rewrite"])
+
+    def test_rewrite_hits_merge_by_best_score_and_truncate(self) -> None:
+        def hit(chunk_id: str, score: float, query: str) -> dict:
+            return {
+                "chunk_id": chunk_id,
+                "original_chunk_id": chunk_id,
+                "retrieval_route": "vector_rewrite",
+                "route_score": score,
+                "source_query": query,
+            }
+
+        merged = self.service.route_retriever.merge_rewrite_hits(
+            [hit("a", 0.6, "q1"), hit("b", 0.5, "q1"), hit("b", 0.9, "q2"), hit("c", 0.7, "q2")],
+            top_k=2,
+        )
+
+        self.assertEqual([item["chunk_id"] for item in merged], ["b", "c"])
+        self.assertEqual([item["route_rank"] for item in merged], [1, 2])
+        self.assertEqual(merged[0]["route_score"], 0.9)
+        self.assertEqual(merged[0]["source_query"], "q2")
+        self.assertEqual(merged[0]["source_queries"], ["q2", "q1"])
+
+    def test_rewrite_route_is_skipped_when_rewrite_matches_translation(self) -> None:
+        question = "What is the method framework?"
+        self.service.query_planner.generation_service.rewrite_query_for_retrieval = lambda _query, **_kwargs: [question]
+
+        bundle = self._build_route_bundle(question, enable_hyde=False, enable_keyword_search=False)
+
+        self.assertEqual(bundle["routes"]["vector_rewrite"], [])
+        self.assertEqual(bundle["route_metrics"]["vector_rewrite"]["fallback_reason"], "covered_by_original")
+
+    def test_original_route_embeds_translation_but_keeps_original_as_source(self) -> None:
+        question = "这篇论文的方法框架是什么？"
+        translated = "What is the method framework of the paper?"
+        self.service.query_planner.generation_service.translate_query_for_retrieval = lambda query, **_kwargs: translated
+
+        bundle = self._build_route_bundle(question, enable_hyde=False, enable_keyword_search=False)
+        original_calls = [
+            call for call in self.service.embedding_service.calls
+            if call["method"] == "create_text_embeddings_with_usage" and call.get("instruct")
+        ]
+
+        # instruct 批次先放原问译文，其后才是改写问句。
+        self.assertEqual(original_calls[0]["texts"][0], translated)
+        self.assertNotIn(question, original_calls[0]["texts"])
+        self.assertTrue(bundle["routes"]["vector_original"])
+        self.assertEqual(bundle["routes"]["vector_original"][0]["chunk_id"], "chunk-method")
+        self.assertEqual({hit["source_query"] for hit in bundle["routes"]["vector_original"]}, {question})
 
     def test_enhancement_route_timeout_is_recorded_without_blocking_pipeline(self) -> None:
         self.service.route_retriever.route_executor.timeouts["keyword"] = 0.01

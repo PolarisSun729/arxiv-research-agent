@@ -67,6 +67,20 @@ def _write_qa_trace(trace: RequestTrace, *, reason: str) -> Optional[str]:
         info_event(logger, "request.trace_written", run_id=trace.run_id, reason=reason, trace_path=trace_path)
     return trace_path
 
+
+def _answer_with_coverage_notice(research_result: PaperEvidenceResearchResult) -> str:
+    """partial 结局里没覆盖的核心需求要明说，不能让用户以为答案已经完整。"""
+    answer = research_result.answer
+    topics = [topic.strip() for topic in research_result.research_summary.unresolved_topics if topic.strip()]
+    if research_result.outcome != "partial" or not topics:
+        return answer
+    if len(topics) == 1:
+        notice = f"关于「{topics[0]}」，这次没能在论文中找到足够的证据，上面的回答没有涉及。"
+    else:
+        notice = "下面这些方面这次没能在论文中找到足够的证据，上面的回答没有涉及：\n" + "\n".join(f"- {topic}" for topic in topics)
+    return f"{answer.rstrip()}\n\n{notice}"
+
+
 class PaperQAService:
     """论文 QA 主流程编排服务。
 
@@ -384,6 +398,7 @@ class PaperQAService:
     ) -> Dict[str, Any]:
         """统一结果、观察与会话落盘；完成持久化后才允许对外发送 done。"""
         request = prepared["request"]
+        answer = _answer_with_coverage_notice(research_result)
         summary = research_result.research_summary.model_dump(mode="json")
         # 只有最终被引用的证据会成为对外 sources；chunk_id 用 source_id 回填，保证脱敏后 ID 不变。
         # 生成前端可持久化的证据契约并隔离本地文件路径：图片只能通过受控的 asset_url 回放。
@@ -425,7 +440,7 @@ class PaperQAService:
         # 研究成功后才创建新会话；会话功能关闭或创建失败时仍为 {}，本轮按无状态处理。
         chat_session = prepared["chat_session"] or self._resolve_chat_session(arxiv_id, prepared["payload"])
         persisted = self.persist_completed_turn(
-            chat_session=chat_session, question=question, answer=research_result.answer,
+            chat_session=chat_session, question=question, answer=answer,
             source_payload=sources, retrieval_debug=retrieval_debug,
             contextualized_question=request.original_question, question_contextualization=contextualization,
         )
@@ -437,7 +452,7 @@ class PaperQAService:
             "persistence_status": "saved" if persisted.get("turn_id") else "not_saved",
             "contextualized_question": request.original_question,
             "used_short_term_memory": bool(contextualization.get("used_short_term_memory")),
-            "question_contextualization": contextualization, "answer": research_result.answer,
+            "question_contextualization": contextualization, "answer": answer,
             "sources": sources, "cited_source_ids": cited_ids,
             "citation_debug": {"verified": True, "repair_attempt_count": summary["citation_repair_count"]},
             "citation_warning": None, "generation_debug": generation_debug,

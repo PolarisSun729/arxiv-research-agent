@@ -98,7 +98,7 @@ def test_remote_rerank_provider_is_included_in_cost(monkeypatch, failure):
     stats = LLMCallStats()
     chunk = {"chunk_id": "c1", "content": "论文方法"}
     with use_call_stats(stats):
-        owner.rerank_service.rerank_with_dashscope("方法", [chunk], [chunk], ["论文方法"], 1, 1)
+        owner.rerank_service.rerank_with_dashscope("方法", [chunk], [chunk], ["论文方法"], 1, 1, original_question="方法")
     assert len(calls) == 1
     assert stats.to_dict()["llm_calls"] == 1
     assert stats.to_dict()["task_calls"] == {"rerank": 1}

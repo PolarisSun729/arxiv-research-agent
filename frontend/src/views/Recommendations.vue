@@ -206,7 +206,7 @@ async function handleLabel(id: string, label: 'liked' | 'disliked' | null) {
 
       <div class="list-head">
         <h2 class="section-title">全部推荐 <span class="muted">{{ store.recommendations.length }}</span></h2>
-        <span class="muted">按相似度排序 · 候选范围仅限 CS.AI</span>
+        <span class="muted">按综合得分排序 · 候选范围仅限 CS.AI</span>
       </div>
       <div class="list">
         <PaperCard

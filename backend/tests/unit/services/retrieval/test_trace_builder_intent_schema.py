@@ -31,25 +31,20 @@ def test_debug_profiles_only_expose_canonical_intent_schema(tmp_path: Path) -> N
     query_profile = QueryProfile(
         original_query=intent_profile.original_query,
         normalized_query=intent_profile.normalized_query,
+        retrieval_query=intent_profile.original_query,
         language="en",
         intent_profile=intent_profile,
         tokens=["method"],
         keywords=["method"],
         intent_tags=["deep_method"],
-        paper_terms=[],
         ambiguity_score=0.1,
-        semantic_query="method",
-        evidence_query="method evidence",
-        keyword_query="method implementation",
         section_preferences=["method"],
-        query_plan={"rewrite_queries": []},
     )
     builder = RetrievalTraceBuilder(
         trace_export_enabled=False,
         trace_export_dir=tmp_path,
         rrf_k=60,
         route_weights={"keyword": 1.0},
-        route_confidence_builder=lambda *args, **kwargs: 1.0,
         route_weights_builder=lambda profile: profile.route_weights,
     )
 

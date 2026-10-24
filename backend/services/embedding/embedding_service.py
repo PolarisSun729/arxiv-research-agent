@@ -76,6 +76,7 @@ class EmbeddingConfig:
         backoff_base_seconds: Optional[float] = None,
         backoff_max_seconds: Optional[float] = None,
         jitter_ratio: Optional[float] = None,
+        instruct: Optional[str] = None,
     ):
         """保存一次 embedding 调用所需的配置参数。
 
@@ -91,6 +92,7 @@ class EmbeddingConfig:
             backoff_base_seconds (Optional[float]): 指数退避的基础秒数。
             backoff_max_seconds (Optional[float]): 单次退避和 Retry-After 的等待上限。
             jitter_ratio (Optional[float]): 退避随机抖动比例。
+            instruct (Optional[str]): 任务说明，只有 DashScope 多模态向量接口支持，用于区分查询侧与文档侧。
         """
         self.provider = provider
         self.model_name = model_name
@@ -99,6 +101,7 @@ class EmbeddingConfig:
         self.dimension = dimension
         self.batch_size = batch_size
         self.enable_fusion = enable_fusion
+        self.instruct = instruct
         configured_max_retries = int(
             EMBEDDING_CONFIG.get("request_max_retries", DASHSCOPE_MAX_REQUEST_RETRIES)
             if request_max_retries is None
@@ -272,6 +275,7 @@ class EmbeddingService:
         api_key: Optional[str],
         base_url: Optional[str],
         dimension: Optional[int],
+        instruct: Optional[str] = None,
     ) -> str:
         """根据文本内容与调用配置生成稳定的缓存键。
 
@@ -282,6 +286,7 @@ class EmbeddingService:
             api_key (Optional[str]): 访问密钥。
             base_url (Optional[str]): 服务地址。
             dimension (Optional[int]): 目标维度。
+            instruct (Optional[str]): 任务说明；同一文本带不同说明得到的向量不同，必须分开缓存。
 
         返回:
             str: 可用于进程内缓存的稳定键值。
@@ -294,6 +299,7 @@ class EmbeddingService:
                 str(api_key or "").strip(),
                 str(base_url or "").strip(),
                 str(dimension or ""),
+                hashlib.sha256(str(instruct or "").encode("utf-8")).hexdigest() if instruct else "",
                 text_hash,
             ]
         )
@@ -410,6 +416,8 @@ class EmbeddingService:
         if config.enable_fusion:
             # enable_fusion 交给后端做文本/图像融合，避免调用侧硬编码融合策略。
             payload["parameters"]["enable_fusion"] = True
+        if config.instruct:
+            payload["parameters"]["instruct"] = config.instruct
 
         response = self._post_dashscope_embedding_request(
             url=url,
@@ -1307,12 +1315,17 @@ class EmbeddingService:
         base_url: Optional[str] = None,
         dimension: Optional[int] = None,
         batch_size: Optional[int] = None,
+        instruct: Optional[str] = None,
     ) -> tuple[List[list], dict]:
-        """批量生成文本 embedding，并在支持时汇总 usage 信息。"""
+        """批量生成文本 embedding，并在支持时汇总 usage 信息。
+
+        instruct 只对 DashScope 生效，其它 provider 没有对应参数，直接忽略。
+        """
         normalized_texts = [str(text or "") for text in texts]
         if not normalized_texts:
             return [], {}
 
+        normalized_provider = str(provider).strip().lower()
         config = EmbeddingConfig(
             provider=provider,
             model_name=model,
@@ -1320,9 +1333,9 @@ class EmbeddingService:
             base_url=base_url,
             dimension=dimension,
             batch_size=batch_size,
+            instruct=(instruct or None) if normalized_provider == EmbeddingProvider.DASHSCOPE.value else None,
         )
 
-        normalized_provider = str(config.provider).strip().lower()
         results: List[Optional[list]] = [None] * len(normalized_texts)
         pending_indexes: List[int] = []
         pending_texts: List[str] = []
@@ -1336,6 +1349,7 @@ class EmbeddingService:
                 api_key=config.api_key,
                 base_url=config.base_url,
                 dimension=config.dimension,
+                instruct=config.instruct,
             )
             cached_embedding = self._get_cached_embedding(cache_key)
             if cached_embedding is not None:
@@ -1370,6 +1384,7 @@ class EmbeddingService:
                             api_key=config.api_key,
                             base_url=config.base_url,
                             dimension=config.dimension,
+                            instruct=config.instruct,
                         )
                         normalized_embedding = self._normalize_vector_output(embedding)
                         self._set_cached_embedding(cache_key, normalized_embedding)
@@ -1392,6 +1407,7 @@ class EmbeddingService:
                             api_key=config.api_key,
                             base_url=config.base_url,
                             dimension=config.dimension,
+                            instruct=config.instruct,
                         )
                         normalized_embedding = self._normalize_vector_output(embedding)
                         self._set_cached_embedding(cache_key, normalized_embedding)

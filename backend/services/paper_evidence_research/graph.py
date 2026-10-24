@@ -154,6 +154,7 @@ def _decide_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperEv
         candidate_count=len(next_state.evidence_candidates),
         current_draft_version=next_state.current_draft.version if next_state.current_draft else None,
         claim_assessments=next_state.claim_assessments,
+        claims=next_state.claims,
         retrievals_remaining=0 if next_state.retrieval_stalled else max(
             0, next_state.request.limits.max_retrievals - next_state.retrieval_count
         ),

@@ -11,10 +11,9 @@
 [`backend/main.py`](../../backend/main.py) 的 `create_app()` 是 FastAPI 装配真源：
 
 1. 创建带 lifespan 的应用，在启动时执行上下文生命周期清理；`preload` 模式才主动预热服务。
-2. 注册 `arxiv`、`agent`、`user`、`paper`、`qa` 五个业务 Router，统一挂在 `/api` 下并附加认证依赖；JWT 模式额外注册 `auth` Router。`/api/auth/check`、`/api/auth/config` 与 `/health` 直接定义在 `create_app()` 中。
-3. 根据 `get_debug_routes_runtime_config()` 决定是否注册 chunk 调试 Router。该 Router 会暴露本地解析产物，只能视为受开关保护的内部能力。
-4. 将 `AppError`、`HTTPException` 和 `RequestValidationError` 收敛成稳定错误响应，并由兜底 `Exception` 处理器把未识别异常转为不含堆栈和 provider 原文的 500；Router 不应自行构造与此冲突的错误格式。
-5. 按“审计 → CORS → IP 过滤 → 认证前限流 → 认证（API Key 或 JWT）→ 用户限流 → 用户日配额 → 业务”装配中间件，响应统一经 `RedactedJSONResponse` 脱敏，并关闭 OpenAPI 文档入口。认证模式、角色、限流和审计的具体规则见 [安全与访问控制](../operations/security.md)。
+2. 注册 `arxiv`、`agent`、`user`、`paper`、`qa` 五个业务 Router 和管理端的 `admin_index` Router，统一挂在 `/api` 下并附加认证依赖；JWT 模式额外注册 `auth` Router。`/api/auth/check`、`/api/auth/config` 与 `/health` 直接定义在 `create_app()` 中。
+3. 将 `AppError`、`HTTPException` 和 `RequestValidationError` 收敛成稳定错误响应，并由兜底 `Exception` 处理器把未识别异常转为不含堆栈和 provider 原文的 500；Router 不应自行构造与此冲突的错误格式。
+4. 按“审计 → CORS → IP 过滤 → 认证前限流 → 认证（API Key 或 JWT）→ 用户限流 → 用户日配额 → 业务”装配中间件，响应统一经 `RedactedJSONResponse` 脱敏，并关闭 OpenAPI 文档入口。认证模式、角色、限流和审计的具体规则见 [安全与访问控制](../operations/security.md)。
 
 [`backend/dependencies.py`](../../backend/dependencies.py) 是服务组合根。它负责构造 `StorageContainer`、模型服务、检索服务、QA 服务、推荐服务和 Agent 所需的 checkpoint store。业务模块应请求具体依赖，例如 `get_paper_qa_service()`，而不是接收一个万能数据库对象。
 

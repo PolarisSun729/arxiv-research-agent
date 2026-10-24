@@ -105,7 +105,7 @@ def initialize_security_config(repo_root: Path, *, profile: str, domain: str = D
         "AUTH_MODE": "jwt", "JWT_SECRET_KEY": "",
         "JWT_SECRET_FILE": secret_path.relative_to(repo_root).as_posix(),
         "AUTH_DATABASE_PATH": "backend/data/auth/production.sqlite3" if production else "backend/data/auth/auth.sqlite3",
-        "ALLOW_PUBLIC_REGISTRATION": "false", "BACKEND_HOST": "127.0.0.1", "ENABLE_DEBUG_ROUTES": "false",
+        "ALLOW_PUBLIC_REGISTRATION": "false", "BACKEND_HOST": "127.0.0.1",
         "ALLOWED_ORIGINS": f"https://{domain}" if production else "http://localhost:5173,http://127.0.0.1:5173",
         "TRUSTED_PROXY_IPS": "127.0.0.1,::1" if production else "",
         "RATE_LIMIT_STORAGE": f"redis://:{quote(redis_password, safe='')}@127.0.0.1:6379/0" if production else "memory://",

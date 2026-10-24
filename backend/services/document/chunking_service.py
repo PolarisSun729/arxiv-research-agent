@@ -20,6 +20,21 @@ MAX_CHUNK_CONTENT_LENGTH = CHUNKING_CONFIG["max_chunk_content_length"]
 CHUNK_OVERLAP_LENGTH = CHUNKING_CONFIG["chunk_overlap_length"]
 ASSET_SECTION_EMBEDDING_CONFIDENCE_FLOOR = 0.70
 
+# Docling 给的标题 level 都是 1，章节层级改由标题编号推断。
+# 这些标题不带编号，固定回到第 1 层；其中参考文献、附录之后才把单个大写字母当附录编号。
+TOP_LEVEL_HEADINGS = {
+    "abstract", "references", "bibliography", "acknowledgements", "acknowledgments",
+    "acknowledgement", "acknowledgment", "appendix", "appendices", "impact statement",
+    "supplementary material", "supplementary materials",
+}
+APPENDIX_START_HEADINGS = {
+    "references", "bibliography", "appendix", "appendices",
+    "supplementary material", "supplementary materials",
+}
+# 编号前缀：阿拉伯数字（3、3.1、3.3.1.）、附录字母（A、A.1）、带点的罗马数字（II.），后面必须跟文字。
+HEADING_NUMBER_PATTERN = re.compile(r"^(?P<head>\d{1,2}|[A-Z]|[IVX]{2,4})(?P<tail>(?:\.\d{1,2})*)(?P<dot>\.?)\s+[^\W\d_]")
+MAX_TOP_LEVEL_SECTION_NUMBER = 20
+
 
 class ChunkingService:
     """
@@ -31,40 +46,6 @@ class ChunkingService:
     3. 为图片、表格等资产生成可检索的补充 chunk；
     4. 在 chunk 过长时继续拆分，并保留父子 chunk 关系。
     """
-
-    def chunk_pymupdf(
-        self,
-        text: Union[str, dict],
-        metadata: dict,
-        page_map: list = None,
-        method: str = "by_titles",
-        chunk_size: int = 500,
-    ) -> dict:
-        """使用 PyMuPDF 页面结构执行切分。
-
-        参数:
-            text (Union[str, dict]): 原始文本或已带结构的文档对象。
-            metadata (dict): 文档元数据，至少应包含文件名、来源等信息。
-            page_map (list): 页级结构列表；若为空，将尝试从 ``text`` 中推断。
-            method (str): 切分策略，例如 by_titles、by_pages 等。
-            chunk_size (int): 目标切分粒度，通常表示词数或句群规模。
-
-        返回:
-            dict: 标准化的切分结果，包含 pages、chunks 及统计信息。
-
-        说明:
-            这里只做入口适配：先补齐 ``loading_method``，再统一委托给
-            ``chunk_text``，避免不同加载器维护各自独立的切分入口。
-        """
-        pymupdf_metadata = dict(metadata or {})
-        pymupdf_metadata["loading_method"] = "pymupdf"
-        return self.chunk_text(
-            text=text,
-            method=method,
-            metadata=pymupdf_metadata,
-            page_map=page_map,
-            chunk_size=chunk_size,
-        )
 
     def chunk_docling(
         self,
@@ -110,7 +91,7 @@ class ChunkingService:
 
         参数:
             text (Union[str, dict]): 原始文本、文档结构对象或 Docling 结果。
-            method (str): 切分方法，例如 by_titles、fixed_size、by_pages。
+            method (str): 切分方法名，只有 docling_sections，原样写入输出的 chunking_method。
             metadata (dict): 文档元数据。
             page_map (list): 页级结构列表；若为空则会尝试从 ``text`` 提取。
             chunk_size (int): 切分粒度配置。
@@ -119,11 +100,11 @@ class ChunkingService:
             dict: 统一格式的切分结果，包含 chunk 列表及文档级统计字段。
 
         异常:
-            ValueError: 当无法构造 page_map 或 method 不受支持时抛出。
+            ValueError: 当无法构造 page_map 时抛出。
 
         说明:
-            这是整个切分流程的统一入口：先规范化页面数据，再按 loading
-            方法或 chunking method 做策略分发，最后统一补齐输出元数据。
+            这是整个切分流程的统一入口：先规范化页面数据，再按 Docling 的章节与图表结构切分，
+            最后统一补齐输出元数据。
         """
         try:
             normalized_page_map = self._normalize_page_map(text, page_map)
@@ -132,23 +113,7 @@ class ChunkingService:
 
             filename = metadata.get("filename", "")
             source_name = metadata.get("filename", "") or metadata.get("source", "")
-            loading_method = str(metadata.get("loading_method", "") or "").strip().lower()
-
-            # Docling 的结构信息更完整，优先使用其 section/asset 逻辑。
-            if loading_method == "docling":
-                chunks = self._chunk_docling_sections(text, normalized_page_map, source_name, chunk_size)
-            elif method == "by_pages":
-                chunks = self._chunk_by_pages(normalized_page_map, source_name)
-            elif method == "fixed_size":
-                chunks = self._chunk_fixed_size(normalized_page_map, source_name, chunk_size)
-            elif method == "by_titles":
-                chunks = self._chunk_by_titles(normalized_page_map, source_name, chunk_size)
-            elif method == "by_paragraphs":
-                chunks = self._chunk_by_paragraphs(normalized_page_map, source_name, chunk_size)
-            elif method == "by_sentences":
-                chunks = self._chunk_by_sentences(normalized_page_map, source_name, chunk_size)
-            else:
-                raise ValueError(f"Unsupported chunking method: {method}")
+            chunks = self._chunk_docling_sections(text, normalized_page_map, source_name, chunk_size)
 
             return self._finalize_chunk_output(
                 filename=filename,
@@ -157,6 +122,7 @@ class ChunkingService:
                 loading_method=metadata.get("loading_method", ""),
                 chunking_method=method,
                 pages=normalized_page_map,
+                chunk_size=chunk_size,
             )
         except Exception as e:
             logger.error(f"Error in chunk_text: {str(e)}")
@@ -170,6 +136,7 @@ class ChunkingService:
         loading_method: str,
         chunking_method: str,
         pages: List[Dict[str, Any]],
+        chunk_size: int,
     ) -> dict:
         """统一补齐 chunk 元数据，并对超长 chunk 做二次展开。
 
@@ -180,6 +147,7 @@ class ChunkingService:
             loading_method (str): 上游加载方式。
             chunking_method (str): 当前采用的切分策略。
             pages (List[Dict[str, Any]]): 标准化后的页级结构。
+            chunk_size (int): 本次切分使用的目标词数，随结果写入 chunking_params。
 
         返回:
             dict: 可直接供下游保存或向量化的统一切分结果。
@@ -228,6 +196,13 @@ class ChunkingService:
             "timestamp": datetime.now().isoformat(),
             "pages": pages,
             "chunks": chunks,
+            # 记录本次实际生效的切分参数，落盘后管理端才能对照参数查看切分效果。
+            "chunking_params": {
+                "chunk_size": int(chunk_size),
+                "max_chunk_content_length": MAX_CHUNK_CONTENT_LENGTH,
+                "chunk_overlap_length": CHUNK_OVERLAP_LENGTH,
+                "split_search_window": CHUNKING_CONFIG["split_search_window"],
+            },
         }
 
     def _expand_overlong_chunks(
@@ -422,191 +397,6 @@ class ChunkingService:
             metadata.update(extra_metadata)
         return metadata
 
-    def _chunk_by_pages(self, normalized_page_map: List[Dict[str, Any]], source_name: str) -> List[Dict[str, Any]]:
-        """按页切分，每页生成一个 chunk。
-
-        参数:
-            normalized_page_map (List[Dict[str, Any]]): 标准化后的页级结构。
-            source_name (str): 文档来源名。
-
-        返回:
-            List[Dict[str, Any]]: 每页一个 chunk 的结果列表。
-        """
-        chunks: List[Dict[str, Any]] = []
-        for page in normalized_page_map:
-            text = self._page_text(page)
-            if not text:
-                continue
-
-            page_num = int(page.get("page", page.get("page_number", 1)))
-            chunks.append(
-                {
-                    "content": text,
-                    "metadata": self._build_chunk_metadata(
-                        source=source_name,
-                        page_start=page_num,
-                        page_end=page_num,
-                        chunk_text=text,
-                        chunk_index=0,
-                        total_chunks=0,
-                        chunking_method="by_pages",
-                    ),
-                }
-            )
-        return chunks
-
-    def _chunk_fixed_size(
-        self,
-        normalized_page_map: List[Dict[str, Any]],
-        source_name: str,
-        chunk_size: int,
-    ) -> List[Dict[str, Any]]:
-        """按固定词数窗口切分每一页文本。
-
-        参数:
-            normalized_page_map (List[Dict[str, Any]]): 标准化后的页级结构。
-            source_name (str): 文档来源名。
-            chunk_size (int): 目标词数窗口大小。
-
-        返回:
-            List[Dict[str, Any]]: 固定大小切分结果。
-        """
-        chunks: List[Dict[str, Any]] = []
-        for page in normalized_page_map:
-            text = self._page_text(page)
-            if not text:
-                continue
-
-            page_num = int(page.get("page", page.get("page_number", 1)))
-            for part in self._split_text_by_words(text, chunk_size):
-                part = part.strip()
-                if not part:
-                    continue
-                chunks.append(
-                    {
-                        "content": part,
-                        "metadata": self._build_chunk_metadata(
-                            source=source_name,
-                            page_start=page_num,
-                            page_end=page_num,
-                            chunk_text=part,
-                            chunk_index=0,
-                            total_chunks=0,
-                            chunking_method="fixed_size",
-                        ),
-                    }
-                )
-        return chunks
-
-    def _chunk_by_titles(
-        self,
-        normalized_page_map: List[Dict[str, Any]],
-        source_name: str,
-        chunk_size: int,
-    ) -> List[Dict[str, Any]]:
-        """根据标题结构切分文本，并在章节内继续按句群分块。
-
-        参数:
-            normalized_page_map (List[Dict[str, Any]]): 标准化后的页级结构。
-            source_name (str): 文档来源名。
-            chunk_size (int): 章节内二次切分粒度。
-
-        返回:
-            List[Dict[str, Any]]: 按标题组织后的 chunk 列表。
-        """
-        lines = self._merge_heading_fragments(self._flatten_document_lines(normalized_page_map))
-        if not lines:
-            return []
-
-        chunks: List[Dict[str, Any]] = []
-        current_title: Optional[str] = None
-        current_level: int = 0
-        current_lines: List[Dict[str, Any]] = []
-
-        def flush_section() -> None:
-            nonlocal current_title, current_level, current_lines
-            if not current_lines:
-                return
-
-            # 标题单独作为结构锚点保留，但正文切分主要基于标题之后的内容。
-            section_lines = current_lines[1:] if current_title else current_lines
-            section_body = self._compose_text_from_lines(section_lines).strip()
-            section_title = current_title or "Preamble"
-            page_start = int(current_lines[0]["page"])
-            page_end = int(current_lines[-1]["page"])
-
-            section_text = f"{current_title}\n{section_body}".strip() if current_title else section_body
-            if not section_text:
-                current_title = None
-                current_level = 0
-                current_lines = []
-                return
-
-            section_chunks = self._split_text_by_sentence_chunks(section_body, chunk_size)
-            if not section_chunks:
-                section_chunks = [section_body or section_text]
-
-            for part_index, part in enumerate(section_chunks, start=1):
-                part_text = part.strip()
-                if current_title:
-                    part_text = f"{current_title}\n{part_text}".strip()
-
-                chunks.append(
-                    {
-                        "content": part_text,
-                        "metadata": self._build_chunk_metadata(
-                            source=source_name,
-                            page_start=page_start,
-                            page_end=page_end,
-                            chunk_text=part_text,
-                            chunk_index=0,
-                            total_chunks=0,
-                            chunking_method="by_titles",
-                            extra_metadata={
-                                "chunk_type": "text",
-                                "section_title": section_title,
-                                "section_level": current_level,
-                                "section_part_index": part_index,
-                                "section_part_count": len(section_chunks),
-                            },
-                        ),
-                    }
-                )
-
-            current_title = None
-            current_level = 0
-            current_lines = []
-
-        for line in lines:
-            text = str(line.get("text", "")).strip()
-            if not text:
-                continue
-
-            heading_level = self._heading_level(line)
-            # Keep the old level-1 split logic for later reuse.
-            # if heading_level == 1:
-            #     flush_section()
-            #     current_title = text
-            #     current_level = int(heading_level)
-            #     current_lines = [line]
-            #     continue
-
-            # 当前策略仅把二级标题作为正式切分点，避免一级标题过粗导致块太大。
-            if heading_level == 2:
-                flush_section()
-                current_title = text
-                current_level = int(heading_level)
-                current_lines = [line]
-                continue
-
-            if not current_lines:
-                current_lines = [line]
-            else:
-                current_lines.append(line)
-
-        flush_section()
-        return chunks
-
     def _chunk_docling_sections(
         self,
         text: Union[str, dict],
@@ -625,21 +415,32 @@ class ChunkingService:
         返回:
             List[Dict[str, Any]]: 基于 Docling section 和资产扩展生成的 chunk 列表。
         """
+        # 没有可用的 Docling 文本项时返回空列表，由上游按「无 chunk」报错，不再退回按页文本切分。
         docling_items = self._collect_docling_items(text, normalized_page_map)
         if not docling_items:
-            return self._chunk_by_titles(normalized_page_map, source_name, chunk_size)
+            return []
 
         sections = self._build_docling_sections(docling_items)
         if not sections:
-            return self._chunk_by_titles(normalized_page_map, source_name, chunk_size)
+            return []
 
         chunks: List[Dict[str, Any]] = []
+        # 只有标题、没有正文的章节（如 "4 Experiments" 后面直接是 "4.1 ..."）不单独成 chunk，
+        # 标题挪到下一个有正文章节的第一个 chunk 开头；文末仍没有正文可挂的标题直接丢弃。
+        pending_headings: List[str] = []
         for section in sections:
+            if section.get("heading_text") and not section.get("body_items"):
+                pending_headings.append(str(section["heading_text"]))
+                continue
+
             # Docling section 已经保留了章节路径和页码范围，适合直接作为主干 chunk。
             section_chunks = self._split_docling_section(section, chunk_size)
             section_part_count = len(section_chunks)
             if not section_part_count:
                 continue
+            if pending_headings:
+                section_chunks[0] = "\n".join(pending_headings + [section_chunks[0]])
+                pending_headings = []
 
             for part_index, part in enumerate(section_chunks, start=1):
                 part_text = part.strip()
@@ -702,6 +503,9 @@ class ChunkingService:
             asset_kind = str(asset.get("asset_kind", "") or "").strip().lower()
             chunk_type = "figure" if asset_kind == "picture" else ("table" if asset_kind == "table" else "text")
             if chunk_type == "text":
+                continue
+            # 目录（label=document_index）Docling 也放在表格里，只有章节名和页码，不当表格证据入库。
+            if str(asset.get("label", "") or "").strip().lower().rsplit(".", 1)[-1] == "document_index":
                 continue
 
             page_start = int(asset.get("page_start") or asset.get("page") or 1)
@@ -1274,7 +1078,7 @@ class ChunkingService:
             parent = str(normalized.get("parent", "") or "").strip().lower()
             if self._docling_parent_is_visual_context(parent):
                 return
-            if str(normalized.get("node_kind", "") or "").strip().lower() in {"visual_text", "noise"}:
+            if self._docling_item_is_noise(normalized):
                 return
             key = (
                 normalized.get("label", ""),
@@ -1345,37 +1149,32 @@ class ChunkingService:
         page_start = self._safe_int(item.get("page_start", item.get("page", item.get("page_number"))))
         page_end = self._safe_int(item.get("page_end", page_start))
         order_index = self._safe_int(item.get("order_index", item.get("line_no", item.get("index"))))
-        heading_candidate = self._is_docling_heading_candidate(text, heading_level)
-        caption_labels = {"caption", "table_caption", "figure_caption"}
+        label_key = label.lower()
 
-        # 先基于显式标签和角色判断，再用启发式补足 heading 分类。
-        if label in caption_labels:
+        # 标题只认 Docling 的版面标签：section_header 是章节标题，title 是论文主标题；
+        # text、list_item 等正文不按文字长相升为标题。没有 label 的条目才看 node_kind / role。
+        if label_key in {"caption", "table_caption", "figure_caption"}:
             node_kind = "caption"
-        elif node_kind == "title":
+        elif label_key in {"section_header", "sectionheaderitem"}:
+            node_kind = "section_header"
+        elif label_key in {"title", "titleitem"}:
             node_kind = "title"
-        elif node_kind == "section_header":
-            node_kind = "section_header" if heading_candidate else "paragraph"
-        elif role == "title":
+        elif label_key:
+            node_kind = "paragraph"
+        elif node_kind == "title" or role == "title":
             node_kind = "title"
-        elif role == "heading":
-            node_kind = "section_header" if heading_candidate else "paragraph"
-        elif heading_level is not None:
-            node_kind = "section_header" if heading_candidate else "paragraph"
-        elif heading_candidate:
+        elif node_kind == "section_header" or role == "heading":
             node_kind = "section_header"
         else:
             node_kind = "paragraph"
 
         # 图片/表格上下文中的短文本更可能是说明文字，不应误判为章节标题。
         if self._docling_parent_is_visual_context(parent) and node_kind == "section_header":
-            if label not in caption_labels:
-                node_kind = "paragraph"
-                heading_level = None
+            node_kind = "paragraph"
+            heading_level = None
 
         if not heading_level and node_kind == "section_header":
-            heading_level = self._heading_level({"text": text, "role": "heading"})
-            if heading_level is None:
-                heading_level = 1
+            heading_level = 1
 
         normalized = {
             "text": text,
@@ -1404,52 +1203,53 @@ class ChunkingService:
 
         if node_kind in {"noise", "visual_text"}:
             return True
-        if content_layer in {"header", "footer"}:
+        # 页眉、页脚（含页码）：Docling 放在 furniture 层（文档对象导出为 "ContentLayer.FURNITURE"），
+        # 标签为 page_header / page_footer；归一化会重算 node_kind，所以要按原始层和标签判断。
+        if content_layer.rsplit(".", 1)[-1] == "furniture":
             return True
-        if label in {"page_number", "pageheader", "pagefooter"}:
+        if label in {"page_header", "page_footer"}:
             return True
         return False
 
     def _docling_item_is_heading(self, item: Dict[str, Any]) -> bool:
+        # item 已经过 _normalize_docling_item，node_kind 只由 Docling 标签决定。
         if self._docling_item_is_noise(item):
             return False
-
         node_kind = str(item.get("node_kind", "") or "").strip().lower()
-        if node_kind == "caption":
-            return False
-        if node_kind == "section_header":
-            return True
-        if node_kind == "title":
-            return True
+        return node_kind in {"section_header", "title"}
 
-        label = str(item.get("label", "") or "").strip().lower()
-        if label in {"caption", "table_caption", "figure_caption"}:
-            return False
-        if label in {"section_header", "sectionheaderitem"}:
-            return self._is_docling_heading_candidate(str(item.get("text", "") or ""), self._safe_int(item.get("heading_level", item.get("level"))))
-        if label in {"title", "titleitem"}:
-            return True
+    def _docling_heading_level(self, heading_text: str, state: Dict[str, Any]) -> int:
+        """按标题编号推断章节层级。
 
-        parent = str(item.get("parent", "") or "").strip().lower()
-        if self._docling_parent_is_visual_context(parent):
-            return False
+        有编号的按段数定层级（3 → 1，3.1 / A.1 → 2）；固定顶层标题（Abstract、References 等）回到第 1 层；
+        没编号的挂在最近一个编号章节下一层。state 跨标题保存 depth（最近编号章节的层级）和 appendix（是否已进入附录）。
+        """
+        text = str(heading_text or "").strip()
+        if text.rstrip(".:").strip().lower() in TOP_LEVEL_HEADINGS:
+            state["depth"] = 0
+            if text.rstrip(".:").strip().lower() in APPENDIX_START_HEADINGS:
+                state["appendix"] = True
+            return 1
 
-        heading_level = item.get("heading_level")
-        text = str(item.get("text", "") or "").strip()
-        if heading_level is not None and text:
-            return self._is_docling_heading_candidate(text, self._safe_int(heading_level))
-        return self._is_docling_heading_candidate(text)
+        match = HEADING_NUMBER_PATTERN.match(text)
+        if match:
+            head, tail, dot = match.group("head"), match.group("tail"), match.group("dot")
+            depth = 1 + tail.count(".")
+            if head.isdigit():
+                numbered = int(head) <= MAX_TOP_LEVEL_SECTION_NUMBER
+            elif len(head) > 1:
+                # 多字符罗马数字只认 "II." 这种带点、无子编号的写法。
+                numbered = bool(dot) and not tail
+            else:
+                # 单个大写字母：有子编号（A.1）或已进入附录时才算附录编号，否则可能是 "A Simple ..." 这类普通标题。
+                numbered = bool(tail) or bool(state.get("appendix"))
+                if numbered:
+                    state["appendix"] = True
+            if numbered:
+                state["depth"] = depth
+                return depth
 
-    def _docling_heading_level(self, item: Dict[str, Any]) -> int:
-        heading_level = self._safe_int(item.get("heading_level"))
-        if heading_level is not None and heading_level > 0:
-            return heading_level
-
-        text = str(item.get("text", "") or "").strip()
-        inferred = self._heading_level({"text": text, "role": "heading"}) if text else None
-        if inferred is not None:
-            return int(inferred)
-        return 1
+        return int(state.get("depth") or 0) + 1
 
     def _build_docling_sections(self, docling_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """根据归一化后的 Docling item 构建章节树的线性 section 结果。
@@ -1463,6 +1263,7 @@ class ChunkingService:
         sections: List[Dict[str, Any]] = []
         stack: List[Dict[str, Any]] = []
         current_section: Optional[Dict[str, Any]] = None
+        level_state: Dict[str, Any] = {"depth": 0, "appendix": False}
 
         def flush_current_section() -> None:
             nonlocal current_section
@@ -1478,7 +1279,7 @@ class ChunkingService:
 
             if self._docling_item_is_heading(item):
                 heading_text = str(item.get("text", "") or "").strip()
-                heading_level = self._docling_heading_level(item)
+                heading_level = self._docling_heading_level(heading_text, level_state)
 
                 flush_current_section()
 
@@ -1648,101 +1449,6 @@ class ChunkingService:
             return ""
         return str(serialized).strip()
 
-    def _merge_heading_fragments(self, lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        if not lines:
-            return []
-
-        merged: List[Dict[str, Any]] = []
-        index = 0
-        while index < len(lines):
-            current = dict(lines[index])
-            next_line = lines[index + 1] if index + 1 < len(lines) else None
-
-            if next_line and current.get("page") == next_line.get("page"):
-                current_text = str(current.get("text", "")).strip()
-                next_text = str(next_line.get("text", "")).strip()
-                if self._is_section_number_only(current_text) and self._looks_like_heading_text(next_text):
-                    try:
-                        section_number = int(current_text.split(".")[0])
-                    except ValueError:
-                        section_number = None
-                    if section_number is None or section_number > 20:
-                        merged.append(current)
-                        index += 1
-                        continue
-                    current["text"] = f"{current_text} {next_text}".strip()
-                    current["heading_level"] = 1 if "." not in current_text else None
-                    current["font_size"] = max(
-                        [value for value in [current.get("font_size"), next_line.get("font_size")] if isinstance(value, (int, float))],
-                        default=current.get("font_size"),
-                    )
-                    merged.append(current)
-                    index += 2
-                    continue
-
-            merged.append(current)
-            index += 1
-
-        return merged
-
-    def _chunk_by_paragraphs(
-        self,
-        normalized_page_map: List[Dict[str, Any]],
-        source_name: str,
-        chunk_size: int,
-    ) -> List[Dict[str, Any]]:
-        chunks: List[Dict[str, Any]] = []
-        for page in normalized_page_map:
-            text = self._page_text(page)
-            if not text:
-                continue
-
-            page_num = int(page.get("page", page.get("page_number", 1)))
-            paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-            if not paragraphs:
-                paragraphs = [text.strip()]
-
-            chunks.extend(
-                self._pack_text_units(
-                    paragraphs,
-                    source_name=source_name,
-                    page_start=page_num,
-                    page_end=page_num,
-                    chunk_size=chunk_size,
-                    chunking_method="by_paragraphs",
-                )
-            )
-        return chunks
-
-    def _chunk_by_sentences(
-        self,
-        normalized_page_map: List[Dict[str, Any]],
-        source_name: str,
-        chunk_size: int,
-    ) -> List[Dict[str, Any]]:
-        chunks: List[Dict[str, Any]] = []
-        for page in normalized_page_map:
-            text = self._page_text(page)
-            if not text:
-                continue
-
-            page_num = int(page.get("page", page.get("page_number", 1)))
-            sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text.strip()) if s.strip()]
-            if not sentences:
-                sentences = [text.strip()]
-
-            chunks.extend(
-                self._pack_text_units(
-                    sentences,
-                    source_name=source_name,
-                    page_start=page_num,
-                    page_end=page_num,
-                    chunk_size=chunk_size,
-                    chunking_method="by_sentences",
-                )
-            )
-        return chunks
-
     def _pack_text_units(
         self,
         units: List[str],
@@ -1812,215 +1518,11 @@ class ChunkingService:
         flush()
         return chunks
 
-    def _flatten_document_lines(self, normalized_page_map: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        lines: List[Dict[str, Any]] = []
-        for page in normalized_page_map:
-            page_num = int(page.get("page", page.get("page_number", len(lines) + 1)))
-            page_lines = page.get("lines")
-
-            if isinstance(page_lines, list) and page_lines:
-                ordered_page_lines = list(page_lines)
-                for index, item in enumerate(ordered_page_lines):
-                    text = str(item.get("text", "")).strip()
-                    if not text:
-                        continue
-
-                    current = {**item, "page": page_num, "text": text}
-                    bbox = current.get("bbox") if isinstance(current.get("bbox"), (list, tuple)) and len(current.get("bbox")) >= 4 else None
-                    prev_item = ordered_page_lines[index - 1] if index > 0 else None
-                    next_item = ordered_page_lines[index + 1] if index + 1 < len(ordered_page_lines) else None
-
-                    if bbox and prev_item and isinstance(prev_item.get("bbox"), (list, tuple)) and len(prev_item.get("bbox")) >= 4:
-                        current["gap_before"] = float(bbox[1]) - float(prev_item["bbox"][3])
-                    else:
-                        current["gap_before"] = None
-
-                    if bbox and next_item and isinstance(next_item.get("bbox"), (list, tuple)) and len(next_item.get("bbox")) >= 4:
-                        current["gap_after"] = float(next_item["bbox"][1]) - float(bbox[3])
-                    else:
-                        current["gap_after"] = None
-
-                    lines.append(current)
-                continue
-
-            raw_text = self._page_text(page)
-            for line_no, text in enumerate(raw_text.split("\n"), start=1):
-                text = text.strip()
-                if not text:
-                    continue
-                lines.append(
-                    {
-                        "page": page_num,
-                        "text": text,
-                        "font_size": None,
-                        "role": None,
-                        "heading_level": None,
-                        "line_no": line_no,
-                    }
-                )
-
-        return lines
-
-    def _compose_text_from_lines(self, lines: List[Dict[str, Any]]) -> str:
-        if not lines:
-            return ""
-
-        parts: List[str] = []
-        for line in lines:
-            text = str(line.get("text", "")).strip()
-            if not text:
-                continue
-            if not parts:
-                parts.append(text)
-                continue
-            if parts[-1].endswith("-") and text and text[0].isalnum():
-                parts[-1] = parts[-1][:-1] + text
-            else:
-                parts.append(text)
-        return " ".join(parts).strip()
-
-    def _heading_level(self, line: Dict[str, Any]) -> Optional[int]:
-        text = str(line.get("text", "")).strip()
-        if not text:
-            return None
-
-        if line.get("role") == "heading":
-            return int(line.get("heading_level") or 1)
-
-        if line.get("heading_level") is not None:
-            try:
-                return int(line["heading_level"])
-            except (TypeError, ValueError):
-                return 1
-
-        if text in {"Abstract", "References"}:
-            return 1
-
-        numbered_match = re.match(r"^([1-9]\d*(?:\.\d+)*)\s+([A-Z].{0,140})$", text)
-        if numbered_match and len(text) <= 160:
-            prefix = numbered_match.group(1)
-            try:
-                leading_number = int(prefix.split(".")[0])
-            except ValueError:
-                return None
-            if leading_number > 20:
-                return None
-            # Numbered top-level sections such as "1 Introduction" remain level 1.
-            # Numbered subsections such as "2.1 ..." are treated as level 2.
-            if "." in prefix:
-                return 2
-            return 1
-
-        words = text.split()
-        if len(words) > 6 or len(text) > 80:
-            return None
-        if text.endswith((".", ",", ";", ":")):
-            return None
-        if any(ch.isdigit() for ch in text):
-            return None
-        if "," in text or "/" in text:
-            return None
-        if not (text[0].isupper() or text.isupper()):
-            return None
-
-        bbox = line.get("bbox")
-        if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
-            line_height = float(bbox[3]) - float(bbox[1])
-        else:
-            line_height = None
-
-        gap_before = line.get("gap_before")
-        gap_after = line.get("gap_after")
-        if not (
-            isinstance(line_height, (int, float))
-            and line_height > 0
-            and isinstance(gap_before, (int, float))
-            and isinstance(gap_after, (int, float))
-            and gap_before >= line_height * 0.75
-            and gap_after >= line_height * 0.6
-        ):
-            return None
-
-        font_size = line.get("font_size")
-        if not (isinstance(font_size, (int, float)) and float(font_size) >= 10.0):
-            return None
-
-        if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
-            if float(bbox[0]) > 85.0:
-                return None
-
-        if text.isupper() and len(words) <= 6:
-            return 1
-
-        if len(words) <= 4:
-            return 1
-
-        return None
-
-    def _looks_like_heading_text(self, text: str) -> bool:
-        normalized = str(text or "").strip()
-        if not normalized:
-            return False
-        if len(normalized) > 80:
-            return False
-        if ":" in normalized:
-            return False
-        if normalized.endswith((".", ",", ";")):
-            return False
-        if any(ch.isdigit() for ch in normalized):
-            return False
-        if "," in normalized or "/" in normalized:
-            return False
-        words = normalized.split()
-        if len(words) > 5:
-            return False
-        if len(words) == 1 and normalized.isupper() and len(normalized) <= 4:
-            return False
-        return normalized[0].isupper() or normalized.isupper()
-
-    def _is_docling_numbered_heading_text(self, text: str) -> bool:
-        normalized = str(text or "").strip()
-        if not normalized:
-            return False
-        return bool(
-            re.fullmatch(
-                r"(?:\d+(?:\.\d+)*|[IVXLCM]+\.?|[A-Z]\.?)\s+[A-Z].{0,160}",
-                normalized,
-            )
-        )
-
-    def _is_docling_heading_candidate(self, text: str, heading_level: Optional[int] = None) -> bool:
-        normalized = str(text or "").strip()
-        if not normalized:
-            return False
-
-        if self._is_docling_numbered_heading_text(normalized):
-            return True
-
-        if normalized.lower() in {"abstract", "references", "acknowledgements", "acknowledgments"}:
-            return True
-
-        if self._looks_like_heading_text(normalized):
-            return True
-
-        if heading_level is not None and heading_level > 0 and len(normalized) <= 80:
-            return self._looks_like_heading_text(normalized)
-
-        return False
-
     def _docling_parent_is_visual_context(self, parent: str) -> bool:
         normalized = str(parent or "").strip().lower()
         if not normalized:
             return False
         return any(token in normalized for token in ("#/pictures/", "#/figures/", "#/tables/"))
-
-    def _is_section_number_only(self, text: str) -> bool:
-        normalized = str(text or "").strip()
-        return bool(re.match(r"^[1-9]\d*(?:\.\d+)*$", normalized))
-
-    def _page_text(self, page: Dict[str, Any]) -> str:
-        text = page.get("text") or page.get("content") or ""
-        return str(text).strip()
 
     def _split_text_by_words(self, text: str, chunk_size: int) -> List[str]:
         words = str(text or "").split()
@@ -2040,55 +1542,3 @@ class ChunkingService:
             chunks.append(" ".join(current))
         return chunks
 
-    def _split_text_by_sentence_chunks(self, text: str, max_words: int) -> List[str]:
-        normalized = re.sub(r"\s+", " ", str(text or "").replace("\r\n", "\n")).strip()
-        if not normalized:
-            return []
-
-        sentences = self._split_into_sentences(normalized)
-        if not sentences:
-            return [normalized]
-
-        chunks: List[str] = []
-        current_sentences: List[str] = []
-        current_words = 0
-
-        def flush() -> None:
-            nonlocal current_sentences, current_words
-            if not current_sentences:
-                return
-            chunk = " ".join(current_sentences).strip()
-            if chunk:
-                chunks.append(chunk)
-            current_sentences = []
-            current_words = 0
-
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if not sentence:
-                continue
-
-            sentence_words = self._word_count(sentence)
-            if sentence_words > max_words:
-                flush()
-                chunks.extend(self._split_text_by_words(sentence, max_words))
-                continue
-
-            if current_sentences and current_words + sentence_words > max_words:
-                flush()
-
-            current_sentences.append(sentence)
-            current_words += sentence_words
-
-        flush()
-        return chunks or [normalized]
-
-    def _split_into_sentences(self, text: str) -> List[str]:
-        normalized = str(text or "").strip()
-        if not normalized:
-            return []
-        sentences = [part.strip() for part in re.split(r"(?<=[.!?。！？；;])\s+", normalized) if part.strip()]
-        return sentences or [normalized]
-
-    def _word_count(self, text: str) -> int:
-        return len(str(text or "").split())

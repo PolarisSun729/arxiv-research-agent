@@ -29,7 +29,7 @@
 - 真实 embedding provider
 - 真实 rerank provider
 - 真实 Milvus / 向量数据库服务
-- 真实 PDF 下载 / Docling / PyMuPDF 解析后端
+- 真实 PDF 下载 / Docling 解析后端
 
 这些测试应使用 `tests/helpers/` 中已有的假服务、mock 对象、动态导入桩或内存假服务。
 

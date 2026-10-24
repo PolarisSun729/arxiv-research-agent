@@ -27,7 +27,12 @@ class RetrievalOptions:
     debug: Optional[bool] = None
     # debug 模式默认还会把检索 trace 落盘；只需要内存中 debug 摘要的调用方显式传 False 跳过写盘。
     export_trace: Optional[bool] = None
+    # 检索调试页要按 chunk 对齐各路召回与各阶段名次，需要原始 chunk 而不是 debug 摘要；只在显式要求时返回。
+    include_stage_chunks: Optional[bool] = None
     memory_context: Optional[Dict[str, Any]] = None
+    # 本篇论文在一次多篇问答中分到的锚点份额，取值 (0, 1]；不传按单篇处理（1.0）。
+    # 份额怎么分（平分或按相关度）由上层决定，管线只负责乘上这个数。
+    paper_share: Optional[float] = None
 
 
 @dataclass
@@ -36,18 +41,15 @@ class QueryProfile:
 
     original_query: str
     normalized_query: str
+    # 原问的英文译文（翻译失败时为原问）；论文正文是英文，tokens/keywords 和路由置信度都按它计算。
+    retrieval_query: str
     language: str
     intent_profile: Any
     tokens: List[str]
     keywords: List[str]
     intent_tags: List[str]
-    paper_terms: List[str]
     ambiguity_score: float
-    semantic_query: str
-    evidence_query: str
-    keyword_query: str
     section_preferences: List[str]
-    query_plan: Dict[str, Any]
 
 
 @dataclass
@@ -98,12 +100,15 @@ class RetrievalPipelineResult:
     chunks: List[Dict[str, Any]]
     debug: Optional[Dict[str, Any]] = None
     trace_export: Optional[Dict[str, str]] = None
+    stage_chunks: Optional[Dict[str, Any]] = None
 
     def to_response(self) -> Dict[str, Any]:
         """转换为接口响应字典；trace_export 同时挂到顶层和 debug 下，兼容两种读取方式。"""
         payload: Dict[str, Any] = {"chunks": self.chunks}
         if self.debug is not None:
             payload["debug"] = self.debug
+        if self.stage_chunks is not None:
+            payload["stage_chunks"] = self.stage_chunks
         if self.trace_export:
             payload["trace_export"] = self.trace_export
             if isinstance(payload.get("debug"), dict):

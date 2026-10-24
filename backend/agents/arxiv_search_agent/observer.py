@@ -159,7 +159,10 @@ def _tool_failure_category(error_code: str, suggested_recovery: Any) -> FailureC
     """根据结构化 ToolError 选择恢复分类，避免 Replanner 继续解析错误字符串。"""
     if error_code == "output_validation_error":
         return "tool_invalid_output"
-    if error_code in {"input_validation_error", "missing_arxiv_id"}:
+    if error_code == "input_validation_error":
+        # 工具输入是计划绑定拼出来的，校验失败属于内部错误，不是用户请求含糊。
+        return "tool_runtime_error"
+    if error_code == "missing_arxiv_id":
         return "ambiguous_user_request"
     if error_code == "preference_target_missing":
         return "preference_target_missing"

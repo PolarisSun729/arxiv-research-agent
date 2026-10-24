@@ -148,15 +148,12 @@ class TableStructuredRetriever:
         self,
         *,
         query_tools: Any,
-        route_confidence_builder: Any,
         structural_bonus_builder: Any,
         config: Dict[str, Any],
     ) -> None:
         # 提供文本归一化与分词（normalize_query_text / tokenize_for_keyword_search）。
         self.query_tools = query_tools
-        # 下面两个构建器当前未被本类使用（表格路由的置信度由 route_retriever 统一计算），
-        # 保留是为了与其它路由检索器的构造参数保持一致。
-        self.route_confidence_builder = route_confidence_builder
+        # 结构加分构建器当前未被本类使用，保留是为了与其它路由检索器的构造参数保持一致。
         self.structural_bonus_builder = structural_bonus_builder
         # 运行期配置：开关、候选表数量、匹配分下限、表格上下文裁剪参数等。
         self.config = config

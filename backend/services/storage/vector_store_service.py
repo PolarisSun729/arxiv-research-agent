@@ -1102,6 +1102,46 @@ class VectorStoreService:
             logger.error(f"Error reading paper embeddings by arxiv ids: {str(e)}")
             raise
 
+    def delete_paper_embeddings_published_before(
+        self,
+        collection_name: str,
+        cutoff_date: str,
+        keep_arxiv_ids: Set[str],
+        dry_run: bool = False,
+    ) -> int:
+        """删除论文级 collection 中 published_date 早于 cutoff_date 的向量，返回删除（或 dry_run 时将删除）的条数。
+
+        published_date 是 YYYY-MM-DD 或 ISO 时间字符串，按字符串比较即可；为空的行无法判断新旧，保留不动。
+        keep_arxiv_ids 里的论文无论多旧都保留。失败直接抛出。
+        """
+        client = self._get_client()
+        described = self._describe_existing_collection(client, collection_name)
+        if described is None:
+            return 0
+        resolved_name, _field_names = described
+        cutoff = str(cutoff_date).replace('"', "")
+        iterator = client.query_iterator(
+            collection_name=resolved_name,
+            batch_size=5000,
+            filter=f'published_date < "{cutoff}" and published_date != ""',
+            output_fields=["arxiv_id"],
+        )
+        ids_to_delete: List[int] = []
+        try:
+            while True:
+                rows = iterator.next()
+                if not rows:
+                    break
+                ids_to_delete.extend(row["id"] for row in rows if str(row.get("arxiv_id") or "").strip() not in keep_arxiv_ids)
+        finally:
+            iterator.close()
+        if dry_run or not ids_to_delete:
+            return len(ids_to_delete)
+        for start in range(0, len(ids_to_delete), 1000):
+            client.delete(collection_name=resolved_name, ids=ids_to_delete[start : start + 1000])
+        client.flush(collection_name=resolved_name)
+        return len(ids_to_delete)
+
     def get_all_chunks(self, collection_name: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """按主键扫描读取 collection 中的 chunk（默认最多 10000 条），返回结构与向量检索结果一致。
 

@@ -16,6 +16,12 @@ rem      If the run is interrupted or a day fails, the cursor stays at the last 
 rem      day and the next run resumes from the failed day.
 rem   3. Missing cursor: start from the latest OAI datestamp in the local database.
 rem   4. Days without records (OAI noRecordsMatch, e.g. weekends) count as success.
+rem   5. Stored papers are also embedded into Milvus (arxiv_paper_embeddings). If the
+rem      embedding API or Milvus fails, the day still counts as success and the cursor
+rem      moves on; run backfill_arxiv_oai_embeddings.cmd later to fill the gaps.
+rem      Only papers first submitted in the last ARXIV_OAI_EMBEDDING_RETENTION_MONTHS
+rem      months (default 6) are embedded; after a successful sync, vectors of older
+rem      papers are deleted, except papers some user liked or disliked.
 rem
 rem Requirements: conda with an env named new_rag, and a local HTTP proxy on
 rem 127.0.0.1:7897. The script waits for Enter before closing, so it is not meant

@@ -232,19 +232,6 @@ class _FakeChunkingService:
             raise RuntimeError("chunking failed")
         return {"chunks": [dict(chunk) for chunk in self.chunks], "document": document}
 
-    def chunk_pymupdf(self, document, method="by_titles", metadata=None, page_map=None):
-        self.calls.append(
-            {
-                "method": "chunk_pymupdf",
-                "chunk_method": method,
-                "metadata": dict(metadata or {}),
-                "page_count": len(page_map or []),
-            }
-        )
-        if self.fail_stage == "chunk_document":
-            raise RuntimeError("chunking failed")
-        return {"chunks": [dict(chunk) for chunk in self.chunks], "document": document}
-
 
 class _FakeEmbeddingConfig:
     def __init__(self, provider="fake", model_name="fake-embedding-model", dimension=8):

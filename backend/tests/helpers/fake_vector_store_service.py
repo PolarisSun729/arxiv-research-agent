@@ -124,7 +124,8 @@ class FakeVectorStoreService:
         results: list[dict[str, Any]] = []
         for row in ranked[:top_k]:
             result = dict(row)
-            result["score"] = self._distance(list(query_vector or []), list(row.get("embedding", []) or []))
+            # 与真实向量库一致：score 越大越相似（L2 距离按 1/(1+d) 换算）。
+            result["score"] = 1.0 / (1.0 + self._distance(list(query_vector or []), list(row.get("embedding", []) or [])))
             results.append(result)
         return results
 

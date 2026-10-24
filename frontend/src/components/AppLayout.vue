@@ -11,6 +11,7 @@ import {
   CollectionTag,
   UserFilled,
   Files,
+  DataAnalysis,
   Fold,
   Expand,
   Setting,
@@ -36,7 +37,6 @@ interface NavGroup {
 const router = useRouter()
 const route = useRoute()
 const userContext = useUserContext()
-const debugRoutesEnabled = import.meta.env.VITE_ENABLE_DEBUG_ROUTES === 'true'
 const COLLAPSE_KEY = 'arxiv_sidebar_collapsed'
 
 function readCollapsed() {
@@ -94,7 +94,8 @@ const navGroups = computed<NavGroup[]>(() => {
       title: '管理',
       items: [
         { path: '/admin/users', label: '账号管理', icon: UserFilled, visible: () => currentUser.value?.role === 'admin' },
-        { path: '/chunks', label: '调试切片', icon: Files, visible: () => debugRoutesEnabled && userContext.isAdmin.value }
+        { path: '/admin/indexes', label: '索引切分', icon: Files, visible: () => currentUser.value?.role === 'admin' },
+        { path: '/admin/retrieval-debug', label: '检索调试', icon: DataAnalysis, visible: () => currentUser.value?.role === 'admin' }
       ]
     }
   ]

@@ -109,7 +109,11 @@ _register(ADMIN_ROLES, None, [
     ("PATCH", "/api/auth/users/{target_user_id}"), ("PUT", "/api/auth/users/{target_user_id}/quotas"),
     ("DELETE", "/api/paper/{arxiv_id}"), ("GET", "/api/sync-status"), ("GET", "/api/agent/graph"),
     ("GET", "/api/paper/{arxiv_id}/qa-diagnose"), ("GET", "/api/paper/{arxiv_id}/qa-trace/latest"),
-    ("GET", "/api/debug/chunks/files"), ("GET", "/api/debug/chunks/file/{filename}"),
+    # 索引切分/解析产物查看：只读，但会展示整篇论文解析文本和本地索引结构。
+    ("GET", "/api/admin/paper-indexes"), ("GET", "/api/admin/paper-indexes/{arxiv_id}"),
+    ("GET", "/api/admin/paper-indexes/{arxiv_id}/parsed"), ("GET", "/api/admin/paper-indexes/{arxiv_id}/assets/{chunk_id}"),
+    # 检索调试：对任意已建索引论文跑一次检索，会调用改写 / HyDE / rerank 模型。
+    ("POST", "/api/admin/retrieval-debug/runs"),
 ])
 
 
@@ -126,6 +130,8 @@ _set_rate_category("read", [("POST", "/api/arxiv/search"), ("POST", "/api/arxiv/
 # 详情在本地缺失时会回源 arXiv、物化论文并生成 embedding（配额在路由内部按需扣减），
 # 不能因为是 GET 就降级为 read 预算。
 _set_rate_category("expensive", [("GET", "/api/paper/{arxiv_id}")])
+# 检索调试不扣配额，但每次都会调用模型，按高成本请求限速。
+_set_rate_category("expensive", [("POST", "/api/admin/retrieval-debug/runs")])
 # 摘要翻译未命中缓存时会调用 LLM；虽然不扣配额，也不能占用普通 write 预算被批量刷。
 _set_rate_category("expensive", [("POST", "/api/paper/{arxiv_id}/abstract-translation/stream")])
 

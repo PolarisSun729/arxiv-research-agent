@@ -80,13 +80,6 @@ CORE_CONFIG: Dict[str, Any] = {
     "service_load_mode": _env_str("BACKEND_SERVICE_LOAD_MODE", "preload"),
 }
 
-DEBUG_ROUTES_CONFIG: Dict[str, Any] = {
-    # 调试路由会读取本地诊断产物，默认关闭，避免生产或演示环境暴露内部文件结构。
-    "enable_debug_routes": _env_bool("ENABLE_DEBUG_ROUTES", False),
-    # chunk 调试接口只返回文本预览，防止一次请求把完整 PDF 解析文本或超大字段暴露出去。
-    "chunk_content_preview_chars": _env_int("DEBUG_CHUNK_CONTENT_PREVIEW_CHARS", 4000),
-}
-
 BACKEND_LOGGING_CONFIG: Dict[str, Any] = {
     # CMD 默认展示请求主时间线；需要深挖时再按模块打开 DEBUG，避免全后端日志一起刷屏。
     "level": (_env_str("BACKEND_LOG_LEVEL", "INFO") or "INFO").upper(),
@@ -136,8 +129,6 @@ DOCLING_CONFIG: Dict[str, Any] = {
     "legend_title_height": float(_env_str("DOCLING_LEGEND_TITLE_HEIGHT", "12.0")),
     "legend_margin": float(_env_str("DOCLING_LEGEND_MARGIN", "12.0")),
     "table_caption_short_text_limit": _env_int("DOCLING_TABLE_CAPTION_SHORT_TEXT_LIMIT", 8),
-    "normalized_upper_short_length": _env_int("DOCLING_NORMALIZED_UPPER_SHORT_LENGTH", 4),
-    "normalized_heading_length": _env_int("DOCLING_NORMALIZED_HEADING_LENGTH", 80),
     "vertical_gap_multiplier": float(_env_str("DOCLING_VERTICAL_GAP_MULTIPLIER", "1.6")),
     "x_aligned_tolerance": float(_env_str("DOCLING_X_ALIGNED_TOLERANCE", "24.0")),
     "same_column_tolerance": float(_env_str("DOCLING_SAME_COLUMN_TOLERANCE", "80.0")),
@@ -335,6 +326,9 @@ ARXIV_OAI_CONFIG: Dict[str, Any] = {
     "embedding_batch_size": _env_int("ARXIV_OAI_EMBEDDING_BATCH_SIZE", 20),
     "vector_query_batch_size": _env_int("ARXIV_OAI_VECTOR_QUERY_BATCH_SIZE", 100),
     "dashscope_text_token_price_per_1k": float(_env_str("ARXIV_OAI_DASHSCOPE_TEXT_TOKEN_PRICE_PER_1K", "0.0007")),
+    # 论文向量只保留首次提交在最近 N 个月内的论文（按 N*30 天算，和推荐近期论文池的口径一致，默认值也与推荐的 6 个月对齐）；
+    # 同步和补向量不给更早的论文生成向量，同步结束时删掉移出窗口的向量（点赞/点踩过的除外）。0 表示不限。
+    "embedding_retention_months": _env_int("ARXIV_OAI_EMBEDDING_RETENTION_MONTHS", 6),
 }
 
 VECTOR_STORE_CONFIG: Dict[str, Any] = {
@@ -548,11 +542,16 @@ PAPER_EVIDENCE_RESEARCH_CONFIG: Dict[str, Any] = {
 }
 
 ENHANCED_RETRIEVAL_CONFIG: Dict[str, Any] = {
-    "query_view_limit": _env_int("ENHANCED_RETRIEVAL_QUERY_VIEW_LIMIT", 6),
-    "query_plan_limit": _env_int("ENHANCED_RETRIEVAL_QUERY_PLAN_LIMIT", 5),
     "recall_candidate_limit": _env_int("ENHANCED_RETRIEVAL_RECALL_CANDIDATE_LIMIT", 30),
-    "rrf_candidate_limit": _env_int("ENHANCED_RETRIEVAL_RRF_CANDIDATE_LIMIT", 30),
-    "rerank_candidate_limit": _env_int("ENHANCED_RETRIEVAL_RERANK_CANDIDATE_LIMIT", 30),
+    # 融合结果不截断，按融合顺序取前 rerank_candidate_limit 条送 rerank，其余接在尾部；
+    # 三路各召回 30 条时候选最多约 90 条，默认 90 即几乎总是全量 rerank（rerank 一次请求打完，90 条约 0.9s）。
+    "rerank_candidate_limit": _env_int("ENHANCED_RETRIEVAL_RERANK_CANDIDATE_LIMIT", 90),
+    # 上下文扩展的锚点数按「论文块数 × 扩展策略比例 × 本篇份额」逐次计算，再夹在 [min, limit] 之间；
+    # limit 是上限（拿不到块数时直接用它），min 防止短论文或多篇分摊后只剩一两个锚点。
+    "context_expansion_anchor_limit": _env_int("ENHANCED_RETRIEVAL_CONTEXT_EXPANSION_ANCHOR_LIMIT", 30),
+    "context_expansion_anchor_min": _env_int("ENHANCED_RETRIEVAL_CONTEXT_EXPANSION_ANCHOR_MIN", 4),
+    # rerank 排在末尾这一比例的块被视为 rerank 已判不相关，结构扩展不能再把它们拉回上下文。
+    "context_expansion_reject_tail_ratio": float(_env_str("ENHANCED_RETRIEVAL_CONTEXT_EXPANSION_REJECT_TAIL_RATIO", "0.3")),
     "final_context_top_k": _env_int("ENHANCED_RETRIEVAL_FINAL_CONTEXT_TOP_K", 15),
     "max_final_context_top_k": _env_int("ENHANCED_RETRIEVAL_MAX_FINAL_CONTEXT_TOP_K", 30),
     "enable_context_expansion": _env_bool("ENHANCED_RETRIEVAL_ENABLE_CONTEXT_EXPANSION", True),
@@ -568,9 +567,6 @@ ENHANCED_RETRIEVAL_CONFIG: Dict[str, Any] = {
     "retrieval_candidate_max_tokens_soft": _env_int("RETRIEVAL_CANDIDATE_MAX_TOKENS_SOFT", 90000),
     "retrieval_candidate_token_chars_per_token": float(_env_str("RETRIEVAL_CANDIDATE_TOKEN_CHARS_PER_TOKEN", "3.0")),
     "sample_limit": _env_int("ENHANCED_RETRIEVAL_SAMPLE_LIMIT", 24),
-    "merge_candidate_terms_limit": _env_int("ENHANCED_RETRIEVAL_MERGE_CANDIDATE_TERMS_LIMIT", 24),
-    "extract_paper_terms_limit": _env_int("ENHANCED_RETRIEVAL_EXTRACT_PAPER_TERMS_LIMIT", 10),
-    "compact_terms_limit": _env_int("ENHANCED_RETRIEVAL_COMPACT_TERMS_LIMIT", 5),
     "extract_query_keywords_limit": _env_int("ENHANCED_RETRIEVAL_EXTRACT_QUERY_KEYWORDS_LIMIT", 8),
     "build_query_keywords_limit": _env_int("ENHANCED_RETRIEVAL_BUILD_QUERY_KEYWORDS_LIMIT", 12),
     "language_weight_zh_mixed": float(_env_str("ENHANCED_RETRIEVAL_LANGUAGE_WEIGHT_ZH_MIXED", "0.1")),
@@ -600,18 +596,7 @@ ENHANCED_RETRIEVAL_CONFIG: Dict[str, Any] = {
     "preview_text_limit": _env_int("ENHANCED_RETRIEVAL_PREVIEW_TEXT_LIMIT", 100),
     "rerank_document_preview_limit": _env_int("ENHANCED_RETRIEVAL_RERANK_DOCUMENT_PREVIEW_LIMIT", 220),
     "candidate_debug_limit": _env_int("ENHANCED_RETRIEVAL_CANDIDATE_DEBUG_LIMIT", 10),
-    "source_sample_limit": _env_int("ENHANCED_RETRIEVAL_SOURCE_SAMPLE_LIMIT", 6),
-    "source_sample_primary_limit": _env_int("ENHANCED_RETRIEVAL_SOURCE_SAMPLE_PRIMARY_LIMIT", 260),
-    "source_sample_secondary_limit": _env_int("ENHANCED_RETRIEVAL_SOURCE_SAMPLE_SECONDARY_LIMIT", 180),
-    "paper_terms_preview_limit": _env_int("ENHANCED_RETRIEVAL_PAPER_TERMS_PREVIEW_LIMIT", 8),
-    "keyword_parts_limit": _env_int("ENHANCED_RETRIEVAL_KEYWORD_PARTS_LIMIT", 8),
     "sanitize_trace_slug_max_length": _env_int("ENHANCED_RETRIEVAL_SANITIZE_TRACE_SLUG_MAX_LENGTH", 40),
-    "query_weight_base_summary_other": float(_env_str("ENHANCED_RETRIEVAL_QUERY_WEIGHT_BASE_SUMMARY_OTHER", "1.05")),
-    "query_weight_base_default": float(_env_str("ENHANCED_RETRIEVAL_QUERY_WEIGHT_BASE_DEFAULT", "0.95")),
-    "query_weight_base_ambiguous_keyword": float(_env_str("ENHANCED_RETRIEVAL_QUERY_WEIGHT_BASE_AMBIGUOUS_KEYWORD", "0.72")),
-    "query_weight_base_ambiguous_other": float(_env_str("ENHANCED_RETRIEVAL_QUERY_WEIGHT_BASE_AMBIGUOUS_OTHER", "0.45")),
-    "query_weight_base_keyword": float(_env_str("ENHANCED_RETRIEVAL_QUERY_WEIGHT_BASE_KEYWORD", "0.52")),
-    "query_weight_base_fallback": float(_env_str("ENHANCED_RETRIEVAL_QUERY_WEIGHT_BASE_FALLBACK", "0.5")),
     "enable_table_structured_route": _env_bool("ENHANCED_RETRIEVAL_ENABLE_TABLE_STRUCTURED_ROUTE", True),
     "table_structured_candidate_limit": _env_int("ENHANCED_RETRIEVAL_TABLE_STRUCTURED_CANDIDATE_LIMIT", 8),
     "table_structured_match_score_floor": float(_env_str("ENHANCED_RETRIEVAL_TABLE_STRUCTURED_MATCH_SCORE_FLOOR", "0.22")),
@@ -619,12 +604,6 @@ ENHANCED_RETRIEVAL_CONFIG: Dict[str, Any] = {
     "table_structured_context_short_table_cell_limit": _env_int("ENHANCED_RETRIEVAL_TABLE_STRUCTURED_CONTEXT_SHORT_TABLE_CELL_LIMIT", 48),
     "table_structured_context_max_rows": _env_int("ENHANCED_RETRIEVAL_TABLE_STRUCTURED_CONTEXT_MAX_ROWS", 12),
     "table_structured_context_focus_window": _env_int("ENHANCED_RETRIEVAL_TABLE_STRUCTURED_CONTEXT_FOCUS_WINDOW", 2),
-    "route_focus_bonus": float(_env_str("ENHANCED_RETRIEVAL_ROUTE_FOCUS_BONUS", "0.08")),
-    "route_summary_bonus": float(_env_str("ENHANCED_RETRIEVAL_ROUTE_SUMMARY_BONUS", "0.05")),
-    "route_keyword_bonus": float(_env_str("ENHANCED_RETRIEVAL_ROUTE_KEYWORD_BONUS", "0.08")),
-    "route_default_floor": float(_env_str("ENHANCED_RETRIEVAL_ROUTE_DEFAULT_FLOOR", "0.2")),
-    "route_confidence_multiplier": float(_env_str("ENHANCED_RETRIEVAL_ROUTE_CONFIDENCE_MULTIPLIER", "0.65")),
-    "route_confidence_similarity_weight": float(_env_str("ENHANCED_RETRIEVAL_ROUTE_CONFIDENCE_SIMILARITY_WEIGHT", "0.35")),
     "route_timeout_default_seconds": float(_env_str("RETRIEVAL_ROUTE_TIMEOUT_DEFAULT_SECONDS", "8")),
     "route_timeout_vector_original_seconds": float(_env_str("RETRIEVAL_ROUTE_TIMEOUT_VECTOR_ORIGINAL_SECONDS", "8")),
     "route_timeout_vector_rewrite_seconds": float(_env_str("RETRIEVAL_ROUTE_TIMEOUT_VECTOR_REWRITE_SECONDS", "8")),
@@ -635,6 +614,12 @@ ENHANCED_RETRIEVAL_CONFIG: Dict[str, Any] = {
     "route_timeout_rerank_seconds": float(_env_str("RETRIEVAL_ROUTE_TIMEOUT_RERANK_SECONDS", "12")),
     "route_max_workers": _env_int("RETRIEVAL_ROUTE_MAX_WORKERS", 4),
     "query_embedding_batch_size": _env_int("RETRIEVAL_QUERY_EMBEDDING_BATCH_SIZE", 20),
+    # 原问向量路由的查询侧任务说明（DashScope 多模态向量接口的 instruct 参数，官方建议用英文）；
+    # 文档侧建索引时不带说明，留空则原问与其它路由一样不带说明。
+    "original_query_embedding_instruct": _env_str(
+        "RETRIEVAL_ORIGINAL_QUERY_EMBEDDING_INSTRUCT",
+        "Given a question about an academic paper, retrieve passages from the paper that answer the question.",
+    ),
 }
 
 INTENT_ROUTING_CONFIG: Dict[str, Any] = {
@@ -751,9 +736,7 @@ RERANK_CONFIG: Dict[str, Any] = {
     "dashscope_api_key": _env_str("RERANK_DASHSCOPE_API_KEY", ALIYUN_API_KEY),
     "base_url": _env_str("RERANK_BASE_URL", _default_rerank_base_url),
     "fallback_local": _env_bool("RERANK_FALLBACK_LOCAL", False),
-    "prompt": _env_str("RERANK_PROMPT", "Retrieve text relevant to the user's query."),
     "batch_size": _env_int("RERANK_BATCH_SIZE", 8),
-    "candidate_limit": _env_int("RERANK_CANDIDATE_LIMIT", 24),
     "max_doc_chars": _env_int("RERANK_MAX_DOC_CHARS", 4096),
     "enable_query_rewrite": _env_bool("ENABLE_QUERY_REWRITE", True),
     "enable_hyde": _env_bool("ENABLE_HYDE", False),
@@ -807,9 +790,7 @@ RETRIEVAL_CONFIG: Dict[str, Any] = {
     "llm_rerank_model_name_or_path": RERANK_CONFIG["model_name"],
     "llm_rerank_local_model_name_or_path": RERANK_CONFIG["local_model_name_or_path"],
     "llm_rerank_batch_size": RERANK_CONFIG["batch_size"],
-    "llm_rerank_candidate_limit": RERANK_CONFIG["candidate_limit"],
     "llm_rerank_max_doc_chars": RERANK_CONFIG["max_doc_chars"],
-    "llm_rerank_prompt": RERANK_CONFIG["prompt"],
     "trace_export_enabled": RERANK_CONFIG["trace_export_enabled"],
     "trace_export_dir": RERANK_CONFIG["trace_export_dir"],
 }
@@ -824,12 +805,13 @@ GENERATION_CONFIG: Dict[str, Any] = {
     "openai_api_key": _env_str("OPENAI_API_KEY", ""),
     "deepseek_api_key": _env_str("DEEPSEEK_API_KEY", ""),
     # rerank 前的 chunk 压缩/摘要使用独立的生成模型配置。
-    "qwen_rerank_compress_model_name": _env_str("QWEN_RERANK_COMPRESS_MODEL_NAME", "qwen3.6-flash"),
+    "qwen_rerank_compress_model_name": _env_str("QWEN_RERANK_COMPRESS_MODEL_NAME", "qwen3.6-plus"),
     "qwen_rerank_compress_enable_thinking": _env_bool("QWEN_RERANK_COMPRESS_ENABLE_THINKING", False),
     "openai_chat_temperature": float(_env_str("OPENAI_CHAT_TEMPERATURE", "0.7")),
     "openai_chat_max_tokens": _env_int("OPENAI_CHAT_MAX_TOKENS", 512),
     "rewrite_query_max_queries_default": _env_int("REWRITE_QUERY_MAX_QUERIES_DEFAULT", 3),
-    "plan_query_max_queries_default": _env_int("PLAN_QUERY_MAX_QUERIES_DEFAULT", 5),
+    # 原问改写的采样温度：低于默认值让改写贴着原问，但不设为 0，保留一点随机性。
+    "query_rewrite_temperature": float(_env_str("QUERY_REWRITE_TEMPERATURE", "0.3")),
     # 每次生成的完整上下文与回答落盘到 05-generation-results，仅供调试复盘；
     # 文件含用户问题和回答原文且没有清理机制，默认关闭，排查时再临时打开。
     "save_generation_results": _env_bool("SAVE_GENERATION_RESULTS", False),
@@ -841,24 +823,24 @@ GENERATION_CONFIG: Dict[str, Any] = {
     "qwen_responses_image_target_bytes": _env_int("QWEN_RESPONSES_IMAGE_TARGET_BYTES", 1_500_000),
     # 任务到模型角色的路由表只保留在配置层，业务代码只负责读取，不再硬编码模型名。
     "task_model_roles": {
-        "intent_recognition": "small",  # 解析用户原始输入以识别高层意图
-        "agent_request_contextualization": "small",  # 借最近对话把 Agent 追问改写成可独立理解的请求
-        "intent_routing": "small",  # 决定将意图路由到哪个子 agent 或处理流水线
-        "search_spec_parse": "small",  # 将自然语言搜索请求转换为结构化的搜索规范
-        "preference_action_parse": "small",  # 解析用户的喜欢/不喜欢/收藏等偏好操作
-        "query_planning": "small",  # 规划多步或多查询的检索策略
-        "query_rewrite": "small",  # 重写或规范化查询以提升检索效果
-        "rerank_query": "small",  # 为重排阶段生成或调整查询
-        "prompt_context_compaction": "small",  # 对长证据块做语义压缩，结果仍需最终回答模型基于证据使用
-        "hyde_generation": "small",  # HYDE 风格的伪文档生成（用于查询扩展）
+        "intent_recognition": "large",  # 解析用户原始输入以识别高层意图
+        "agent_request_contextualization": "large",  # 借最近对话把 Agent 追问改写成可独立理解的请求
+        "intent_routing": "large",  # 决定将意图路由到哪个子 agent 或处理流水线
+        "search_spec_parse": "large",  # 将自然语言搜索请求转换为结构化的搜索规范
+        "preference_action_parse": "large",  # 解析用户的喜欢/不喜欢/收藏等偏好操作
+        "query_rewrite": "large",  # 把问题改写成贴合论文术语的英文检索问句（具体化指代、拆分复合问题）
+        "query_translation": "large",  # 把用户问题译成英文，供原问向量路由检索英文论文
+        "rerank_query": "large",  # 为重排阶段生成或调整查询
+        "prompt_context_compaction": "large",  # 对长证据块做语义压缩，结果仍需最终回答模型基于证据使用
+        "hyde_generation": "large",  # HYDE 风格的伪文档生成（用于查询扩展）
         "paper_qa_final_answer": "large",  # 为论文问答生成最终高质量答案
         "paper_summary": "large",  # 生成论文的综合性摘要
         "paper_detail": "large",  # 生成方法或技术细节的详尽说明
         "paper_qa": "large",  # 处理关于具体论文的问答
         "recommendation_generation": "large",  # 生成个性化推荐文本或推荐理由
         "general_generation": "large",  # 用于复杂自然语言输出的一般大模型生成
-        "research_claim_extraction": "small",  # 研究引擎把草稿拆成可校验主张并绑定证据需求（只回片段编号，小模型够用）
-        "research_claim_verification": "small",  # 研究引擎逐条对照引用证据核对主张
+        "research_claim_extraction": "large",  # 研究引擎把草稿拆成可校验主张并绑定证据需求
+        "research_claim_verification": "large",  # 研究引擎逐条对照引用证据核对主张
         "abstract_translation": "small",  # 论文卡片上把英文摘要流式翻译成中文，首字时延优先
         "default": "large",  # 当无特定任务映射时的默认模型角色
     },
@@ -867,10 +849,6 @@ GENERATION_CONFIG: Dict[str, Any] = {
 
 def get_chunking_runtime_config() -> Dict[str, Any]:
     return dict(CHUNKING_CONFIG)
-
-
-def get_debug_routes_runtime_config() -> Dict[str, Any]:
-    return dict(DEBUG_ROUTES_CONFIG)
 
 
 def get_backend_logging_runtime_config() -> Dict[str, Any]:

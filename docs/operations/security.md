@@ -63,11 +63,11 @@ python scripts/manage_users.py set-password --username admin --env-file .env.pro
 | 已有索引 QA；本人会话/偏好/画像 | ✓ | ✓ | ✓ | ✓ |
 | 导入/下载论文、建索引、画像重建 | ✓ | ✓ | ✗ | ✗ |
 | Agent 对话与续跑 | ✓ | ✓ | ✗ | ✗ |
-| 删除共享论文、全局 trace/诊断、debug 路由 | ✓ | ✗ | ✗ | ✗ |
+| 删除共享论文、全局 trace/诊断、索引切分查看 | ✓ | ✗ | ✗ | ✗ |
 | 用户、角色与配额管理 | ✓ | ✗ | ✗ | ✗ |
 
 - 论文元数据、索引和证据图片是共享资料；本人数据的 `user_id` 一律来自已验证的 `/me`。管理员管理账号使用独立的 `target_user_id`，普通业务接口不能代他人操作。
-- 全局 trace 可能含他人问题，仅管理员可读，debug 路由还需 `ENABLE_DEBUG_ROUTES=true`。
+- 全局 trace 可能含他人问题，仅管理员可读。
 - JWT 新账号不会自动认领 `local_user`、`u-demo` 或历史匿名 checkpoint；历史数据需由操作员核实归属后定向迁移。
 - 没有团队租户、私有论文库、自动刷新令牌、邮箱验证、MFA 或公开忘记密码接口。
 

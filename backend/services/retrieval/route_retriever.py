@@ -2,21 +2,32 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
+from time import perf_counter
 from typing import Any, Callable, Dict, List, Optional
 
-from services.intent.intent_service import EXPERIMENT_INTENTS, METHOD_INTENTS, OVERVIEW_INTENTS
 from services.retrieval.collection_profile import CollectionRetrievalProfile
 from services.retrieval.contracts import QueryProfile, RetrievalOptions
 from services.retrieval.execution import QueryEmbeddingBatcher, RouteExecutionSupport
 from services.retrieval.index_hit_aggregator import IndexHitAggregator
 from services.retrieval.numeric_utils import min_max_normalize, require_float
 from services.retrieval.retrieval_index import CollectionRetrievalIndex, VECTOR_ROUTE_NAMES
+from services.retrieval.retrieval_rules import stem_english_tokens
 from utils.config import get_enhanced_retrieval_runtime_config
 
 ENHANCED_RETRIEVAL_CONFIG = get_enhanced_retrieval_runtime_config()
 
 logger = logging.getLogger(__name__)
+
+# 方法/数据集/基线等结构词出现在正文开头时给 BM25 加分；查询 token 已经是词干，这里也存词干。
+_BM25_BOOST_STEMS = set(
+    stem_english_tokens(["method", "dataset", "baseline", "ablation", "limitation"])
+)
+
+_CJK_PATTERN = re.compile(r"[一-鿿]")
 
 
 def _inactive_route_metric(
@@ -60,7 +71,6 @@ class RouteRetriever:
         query_tools: Any,
         fusion_service: Any,
         table_structured_retriever: Any,
-        route_confidence_builder: Any,
         structural_bonus_builder: Any,
         chunk_normalizer: Any,
         memory_flag_reader: Any,
@@ -73,13 +83,14 @@ class RouteRetriever:
         self.query_tools = query_tools
         self.fusion_service = fusion_service
         self.table_structured_retriever = table_structured_retriever
-        self.route_confidence_builder = route_confidence_builder
         self.structural_bonus_builder = structural_bonus_builder
         self.chunk_normalizer = chunk_normalizer
         self.memory_flag_reader = memory_flag_reader
         self.collection_profile_provider = collection_profile_provider
         self.collection_retrieval_index_provider = collection_retrieval_index_provider
         self.embedding_batcher = QueryEmbeddingBatcher(embedding_service=self.embedding_service)
+        # 原问路由带 instruct 的 embedding 与主批并发请求，单独的小池子，不占 route worker。
+        self._embedding_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="query-embedding")
         self.index_hit_aggregator = IndexHitAggregator()
         self.route_executor = RouteExecutionSupport(
             timeouts={
@@ -111,7 +122,6 @@ class RouteRetriever:
         # 无论配置哪个后端，都先准备好内置 BM25 作为降级目标。
         internal_backend = InternalBM25Backend(
             query_tools=self.query_tools,
-            route_confidence_builder=self.route_confidence_builder,
             structural_bonus_builder=self.structural_bonus_builder,
             fusion_service=self.fusion_service,
         )
@@ -124,7 +134,6 @@ class RouteRetriever:
         try:
             bm25s_backend = BM25sBackend(
                 query_tools=self.query_tools,
-                route_confidence_builder=self.route_confidence_builder,
                 structural_bonus_builder=self.structural_bonus_builder,
                 fusion_service=self.fusion_service,
             )
@@ -185,64 +194,72 @@ class RouteRetriever:
                 collection_name,
                 collection_profile=collection_profile,
             )
-        intent_profile = query_profile.intent_profile
-        hyde_text = ""
-        hyde_debug: Dict[str, Any] = {"enabled": enable_hyde, "text": "", "source_queries": [], "focus_queries": [], "confidence": 0.0}
-        if enable_hyde:
-            hyde_text = self.generate_hyde_document(user_query, query_profile, query_views["selected_queries"])
-            hyde_debug = {
-                "enabled": True,
-                "text": hyde_text,
-                "source_queries": [user_query, *query_views["selected_queries"]],
-                "focus_queries": query_views["selected_queries"][:2] if query_views["selected_queries"] else [user_query],
-                "confidence": self.route_confidence_builder(
-                    "vector_hyde",
-                    query_profile,
-                    hyde_text or user_query,
-                    route_queries=query_views["selected_queries"] or [user_query],
-                    intent_profile=intent_profile,
-                ),
-            }
+        hyde = (
+            self.generate_hyde_document(user_query)
+            if enable_hyde
+            else {"text": "", "status": "disabled", "error": "", "latency_ms": 0.0}
+        )
+        hyde_text = hyde["text"]
+        hyde_debug: Dict[str, Any] = {
+            "enabled": bool(enable_hyde),
+            # HyDE 只拿原问生成，不用改写问句。
+            "input_query": user_query,
+            **hyde,
+        }
 
         default_embedding_config = self.embedding_service.get_default_embedding_config()
         embedding_provider = str(collection_profile.embedding_provider or default_embedding_config.provider)
         embedding_model = str(collection_profile.embedding_model or default_embedding_config.model_name)
         embedding_dimension = int(collection_profile.vector_dimension) if collection_profile.vector_dimension else None
-        rewrite_queries = query_views["selected_queries"] if query_views["enabled"] and query_views["selected_queries"] else []
-        view_queries = query_views.get("view_queries", {}) or {}
-        # batch 输入显式覆盖 original / semantic / evidence / keyword / rewrite / HyDE 视图；
+        rewrite_queries = query_views["selected_queries"] if query_views["enabled"] else []
         # QueryEmbeddingBatcher 会统一归一化去重，避免不同 route 各自请求 embedding。
-        batch_queries = [
-            user_query,
-            view_queries.get("original", ""),
-            view_queries.get("semantic", ""),
-            view_queries.get("evidence", ""),
-            view_queries.get("keywords", ""),
-            *rewrite_queries,
-            hyde_text,
-        ]
+        batch_queries = [user_query, hyde_text]
+        batch_size = ENHANCED_RETRIEVAL_CONFIG.get("query_embedding_batch_size", 20)
+        # 原问路由用英文译文检索英文正文；翻译失败时 planner 已回退为原问。
+        original_query = str((query_views.get("original_translation") or {}).get("query") or user_query)
+        original_instruct = str(ENHANCED_RETRIEVAL_CONFIG.get("original_query_embedding_instruct") or "")
+        original_embedding_future = None
+        if original_instruct:
+            # 原问译文和改写问句都是问句，共用查询侧说明；这批向量与其它路由不通用，单独一批并与主批并发请求。
+            original_embedding_future = self._embedding_pool.submit(
+                copy_context().run,
+                self.embedding_batcher.build,
+                [original_query, *rewrite_queries],
+                provider=embedding_provider,
+                model=embedding_model,
+                dimension=embedding_dimension,
+                batch_size=batch_size,
+                instruct=original_instruct,
+            )
+        else:
+            batch_queries.extend([original_query, *rewrite_queries])
         embedding_batch = self.embedding_batcher.build(
             batch_queries,
             provider=embedding_provider,
             model=embedding_model,
             dimension=embedding_dimension,
-            batch_size=ENHANCED_RETRIEVAL_CONFIG.get("query_embedding_batch_size", 20),
+            batch_size=batch_size,
         )
         embedding_map = embedding_batch["embeddings"]
+        original_embedding_map = embedding_map
+        if original_embedding_future is not None:
+            original_embedding_batch = original_embedding_future.result()
+            original_embedding_map = original_embedding_batch["embeddings"]
+            embedding_batch["debug"]["original_query_batch"] = original_embedding_batch["debug"]
         route_metrics: Dict[str, Any] = {}
         routes: Dict[str, List[Dict[str, Any]]] = {}
         original_result = self.route_executor.run(
             "vector_original",
             lambda: self.vector_retrieve(
                 collection_name=collection_name,
-                query=user_query,
+                query=original_query,
                 top_k=recall_candidate_limit,
                 route_name="vector_original",
+                # 命中来源仍记用户原问，译文只用于向量检索。
                 source_query=user_query,
                 query_profile=query_profile,
-                route_queries=[user_query],
                 collection_profile=collection_profile,
-                embedding_map=embedding_map,
+                embedding_map=original_embedding_map,
             ),
             required=True,
             cache_hit=bool(collection_profile.cache_hit),
@@ -263,23 +280,23 @@ class RouteRetriever:
                         route_name="vector_rewrite",
                         source_query=query,
                         query_profile=query_profile,
-                        route_queries=rewrite_queries,
                         collection_profile=collection_profile,
-                        embedding_map=embedding_map,
+                        embedding_map=original_embedding_map,
                     ),
                     required=False,
                     cache_hit=bool(collection_profile.cache_hit),
                 )
                 rewrite_route_results.append(rewrite_result)
                 rewrite_hits.extend(rewrite_result.results)
-            routes["vector_rewrite"] = self.fusion_service.dedupe_preserve_order(rewrite_hits)
+            routes["vector_rewrite"] = self.merge_rewrite_hits(rewrite_hits, top_k=recall_candidate_limit)
             route_metrics["vector_rewrite"] = self.combine_route_metrics("vector_rewrite", rewrite_route_results, len(routes["vector_rewrite"]))
         else:
             routes["vector_rewrite"] = []
+            # 改写关闭时记 disabled；开启时记 planner 给出的跳过原因（error / covered_by_original / invalid_output）。
             route_metrics["vector_rewrite"] = _inactive_route_metric(
-                enabled=False,
+                enabled=bool(query_views["enabled"]),
                 cache_hit=bool(collection_profile.cache_hit),
-                fallback_reason="disabled",
+                fallback_reason=str(query_views.get("rewrite_status") or "disabled") if query_views["enabled"] else "disabled",
             )
 
         if hyde_text:
@@ -292,7 +309,6 @@ class RouteRetriever:
                     route_name="vector_hyde",
                     source_query="hyde",
                     query_profile=query_profile,
-                    route_queries=[hyde_text],
                     collection_profile=collection_profile,
                     embedding_map=embedding_map,
                 ),
@@ -303,15 +319,17 @@ class RouteRetriever:
             route_metrics["vector_hyde"] = hyde_result.to_metric()
         else:
             routes["vector_hyde"] = []
+            # 关闭时记 disabled；开启时记生成的失败原因（error / invalid_output）。
             route_metrics["vector_hyde"] = _inactive_route_metric(
                 enabled=bool(enable_hyde),
                 cache_hit=bool(collection_profile.cache_hit),
-                fallback_reason="no_hyde_text",
+                fallback_reason=str(hyde["status"]),
+                error=str(hyde["error"]),
             )
 
         if enable_keyword_search:
-            # keyword route 以用户原问和 planner 的 keyword_query 为主，rewrite/semantic/evidence 只做辅助召回；
-            # 否则通用改写词（如 method/section/framework）会在 BM25 中等权累加并压过真实问题焦点。
+            # keyword route 以原问（英文译文）为主，改写问句只做辅助召回；
+            # 否则改写里的通用词（如 method/section/framework）会在 BM25 中等权累加并压过真实问题焦点。
             keyword_query_views = self.build_keyword_query_views(
                 user_query=user_query,
                 query_profile=query_profile,
@@ -495,18 +513,17 @@ class RouteRetriever:
         query_profile: QueryProfile,
         query_views: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
-        """统一管理 keyword route 的 query view 来源、去重与权重，避免 rewrite 数量直接放大 BM25。"""
-        raw_views: List[Dict[str, Any]] = []
-        view_queries = query_views.get("view_queries", {}) or {}
-        raw_views.append({"query": user_query, "source": "original", "source_index": 0})
-        raw_views.append({"query": query_profile.keyword_query, "source": "keyword", "source_index": 0})
-        raw_views.append({"query": query_profile.evidence_query, "source": "evidence", "source_index": 0})
-        raw_views.append({"query": query_profile.semantic_query, "source": "semantic", "source_index": 0})
+        """统一管理 keyword route 的 query view 来源、去重与权重，避免 rewrite 数量直接放大 BM25。
+
+        原问 view 用英文译文：论文正文是英文，中文原问在 BM25 倒排里基本命不中。
+        翻译失败时 planner 已把译文退回成原问，这里直接沿用。
+        """
+        original_query = str((query_views.get("original_translation") or {}).get("query") or user_query)
+        raw_views: List[Dict[str, Any]] = [
+            {"query": original_query, "source": "original", "source_index": 0, "original_question": user_query}
+        ]
         for idx, query in enumerate(query_views.get("selected_queries", []) or []):
             raw_views.append({"query": query, "source": "rewrite", "source_index": idx})
-        hyde_query = str(view_queries.get("hyde", "") or "").strip()
-        if hyde_query:
-            raw_views.append({"query": hyde_query, "source": "hyde", "source_index": 0})
 
         kept: List[Dict[str, Any]] = []
         for row in raw_views:
@@ -572,6 +589,8 @@ class RouteRetriever:
                     "selected": True,
                     "reason": "kept",
                     "merged_views": [],
+                    # 原问 view 记下用户原问，debug 里能对照译文。
+                    **({"original_question": row["original_question"]} if row.get("original_question") else {}),
                 }
             )
 
@@ -581,11 +600,10 @@ class RouteRetriever:
         return kept
 
     def normalize_keyword_query_view(self, query: str) -> str:
-        """把 query 归一化为“过滤 + 扩展后的去重小写 token 串”，用于判断两个 query view 是否重复。"""
+        """把 query 归一化为“过滤停用词后的去重小写 token 串”，用于判断两个 query view 是否重复。"""
         tokens = self.filter_keyword_query_tokens(self.query_tools.tokenize_for_keyword_search(query))
-        expanded_tokens = self.expand_keyword_query_tokens(tokens)
         seen: List[str] = []
-        for token in expanded_tokens:
+        for token in tokens:
             normalized = str(token or "").strip().lower()
             if normalized and normalized not in seen:
                 seen.append(normalized)
@@ -612,14 +630,6 @@ class RouteRetriever:
         normalized = str(source or "rewrite").strip().lower()
         if normalized == "original":
             return 1.22
-        if normalized == "evidence":
-            return 0.78
-        if normalized == "semantic":
-            return 0.48
-        if normalized == "keyword":
-            return 0.9
-        if normalized == "hyde":
-            return 0.34
         if normalized == "rewrite":
             return min(0.3, 0.65 / max(rewrite_count, 1))
         return 0.3
@@ -693,50 +703,6 @@ class RouteRetriever:
 
         return flags
 
-    @classmethod
-    def adjust_keyword_route_confidence(
-        cls,
-        base_confidence: float,
-        *,
-        matched_terms: List[Dict[str, Any]],
-        noise_flags: List[str],
-        query_profile: QueryProfile,
-    ) -> float:
-        """结合实际 BM25 命中质量调节 keyword route confidence，而不是只看 query profile。
-
-        - contribution/paper_overview 问题降低 BM25 影响，避免泛词 chunk 压过向量召回；
-        - 方法、实验、数据集、对比和局限类正式 intent 维持或略增，让精确术语补充向量；
-        - 命中质量差（只命中低 IDF/噪声字段）时显著降权。
-        """
-        main_intent = cls.query_main_intent(query_profile)
-        factor = 1.0
-        if main_intent in {*OVERVIEW_INTENTS, "other"}:
-            factor *= 0.82
-        elif main_intent in {*METHOD_INTENTS, *EXPERIMENT_INTENTS, "dataset", "comparison", "limitation"}:
-            factor *= 1.08
-        # figure_table 等其它意图保持 factor 不变（原先这里有一个 factor *= 1.0 的空操作分支，已删除）。
-
-        # 命中质量：以最高 IDF 命中词为代表，越是只命中泛词越要降权。
-        max_idf = max((float(term.get("idf", 0.0) or 0.0) for term in matched_terms), default=0.0)
-        if max_idf < cls.LOW_IDF_THRESHOLD:
-            factor *= 0.55
-        elif max_idf < 1.2:
-            factor *= 0.85
-
-        penalty_flags = {
-            "only_low_idf_terms": 0.6,
-            "no_informative_terms": 0.5,
-            "garbled_tokens": 0.85,
-            "asset_field_only_hit": 0.6,
-            "intent_field_mismatch": 0.7,
-            "short_section_header_only": 0.8,
-        }
-        for flag in noise_flags:
-            factor *= penalty_flags.get(flag, 1.0)
-
-        floor = float(ENHANCED_RETRIEVAL_CONFIG.get("route_default_floor", 0.2))
-        return max(floor * 0.5, min(1.0, float(base_confidence) * factor))
-
     @staticmethod
     def query_main_intent(query_profile: QueryProfile) -> str:
         """取查询的主意图（小写），缺失时为 other。"""
@@ -748,16 +714,50 @@ class RouteRetriever:
         """小写并压缩空白，用于比较章节标题/路径的实际长度。"""
         return " ".join(str(text or "").strip().lower().split())
 
-    def generate_hyde_document(self, user_query: str, query_profile: QueryProfile, rewritten_queries: List[str]) -> str:
-        """生成 HyDE（假设性答案文档）文本：优先调用生成服务，失败或为空时使用规则模板。"""
-        if self.generation_service is not None:
-            try:
-                text = self.generation_service.generate_hyde_document(user_query)
-                if text and text.strip():
-                    return text.strip()
-            except Exception:
-                pass
-        return self.heuristic_hyde_document(query_profile, rewritten_queries)
+    def generate_hyde_document(self, user_query: str) -> Dict[str, Any]:
+        """让 LLM 按原问写一段假设性论文片段（HyDE），供 vector_hyde 路由检索。
+
+        不做规则兜底：生成失败或为空时 status=error，含中文时 status=invalid_output（正文是英文），
+        两种情况 text 都为空，HyDE 路由直接跳过。
+        """
+        started = perf_counter()
+        result: Dict[str, Any] = {"text": "", "status": "ok", "error": "", "latency_ms": 0.0}
+        try:
+            if self.generation_service is None:
+                raise RuntimeError("generation service unavailable")
+            text = str(self.generation_service.generate_hyde_document(user_query) or "").strip()
+            if not text:
+                raise ValueError("empty hyde document")
+            if _CJK_PATTERN.search(text):
+                result.update({"status": "invalid_output", "error": "hyde document is not in English"})
+            else:
+                result["text"] = text
+        except Exception as exc:
+            logger.warning("HyDE generation failed, skipping the hyde route: %s", exc)
+            result.update({"status": "error", "error": str(exc)})
+        result["latency_ms"] = round((perf_counter() - started) * 1000, 1)
+        return result
+
+    def merge_rewrite_hits(self, hits: List[Dict[str, Any]], *, top_k: int) -> List[Dict[str, Any]]:
+        """合并多条改写问句的召回：同一 chunk 取最高路由分，按分数重排后截断到 top_k。
+
+        拆分出的子问题各自召回自己那部分证据，取最高分能让每个子问题的最佳命中都排在前面；
+        直接拼接会让第二条及之后问句的命中全部排到第一条的 top_k 之后。
+        """
+        ordered = sorted(hits, key=lambda item: -float(item["route_score"]))
+        source_queries: Dict[str, List[str]] = {}
+        for item in ordered:
+            queries = source_queries.setdefault(self.fusion_service.chunk_unique_key(item), [])
+            if item.get("source_query") not in queries:
+                queries.append(item.get("source_query"))
+        # dedupe 保留首次出现（即最高分）的命中，其余命中的 index 明细并入 matched_indexes。
+        merged = self.fusion_service.dedupe_route_results(ordered)[:top_k]
+        normalized_scores = self.normalize_scores([float(item["route_score"]) for item in merged])
+        for rank, (item, normalized_score) in enumerate(zip(merged, normalized_scores), start=1):
+            item["route_rank"] = rank
+            item["normalized_route_score"] = float(normalized_score)
+            item["source_queries"] = source_queries[self.fusion_service.chunk_unique_key(item)]
+        return merged
 
     @staticmethod
     def combine_route_metrics(route_name: str, route_results: List[Any], candidate_count: int) -> Dict[str, Any]:
@@ -787,7 +787,6 @@ class RouteRetriever:
         route_name: str,
         source_query: str,
         query_profile: QueryProfile,
-        route_queries: List[str],
         collection_profile: CollectionRetrievalProfile,
         embedding_map: Dict[str, List[float]],
     ) -> List[Dict[str, Any]]:
@@ -803,8 +802,7 @@ class RouteRetriever:
             query_vector=embedding,
             top_k=index_hit_top_k,
         )
-        route_confidence = self.route_confidence_builder(route_name, query_profile, source_query, route_queries=route_queries, intent_profile=query_profile.intent_profile)
-        return self.normalize_route_results(results, route_name, source_query, route_confidence, query_profile, top_k=top_k)
+        return self.normalize_route_results(results, route_name, source_query, query_profile, top_k=top_k)
 
     def _aggregate_keyword_hits(self, hits: List[Dict[str, Any]], debug: Dict[str, Any], *, top_k: int) -> Dict[str, Any]:
         """把关键词后端返回的 index 级命中聚合成 chunk 级候选，并在 debug 中记录聚合前后数量。"""
@@ -854,7 +852,6 @@ class RouteRetriever:
         # 运行期降级到内置 BM25。
         internal_backend = InternalBM25Backend(
             query_tools=self.query_tools,
-            route_confidence_builder=self.route_confidence_builder,
             structural_bonus_builder=self.structural_bonus_builder,
             fusion_service=self.fusion_service,
         )
@@ -873,13 +870,6 @@ class RouteRetriever:
             self._keyword_backend, "backend_name", lambda: "unknown"
         )() + " failed"
         return self._aggregate_keyword_hits(fallback_result.results, debug, top_k=top_k)
-
-    def expand_keyword_query_tokens(self, tokens: List[str]) -> List[str]:
-        """调用 query_tools 做同义词/缩写扩展；query_tools 未提供该能力时原样返回。"""
-        expander = getattr(self.query_tools, "expand_keyword_query_tokens", None)
-        if callable(expander):
-            return expander(tokens)
-        return tokens
 
     def filter_keyword_query_tokens(self, tokens: List[str]) -> List[str]:
         """调用 query_tools 过滤停用词、保留关键词（limit 设为 token 数，即只过滤不截断）。"""
@@ -947,7 +937,7 @@ class RouteRetriever:
                     matched_doc_ids.append(doc_id)
                 chunk = retrieval_index.documents[doc_id].chunk
                 route_results.append(self.build_memory_route_chunk(candidate, chunk, memory_context, query_keywords, query_profile))
-        ranked = sorted(route_results, key=lambda item: (float(item.get("memory_score", 0.0) or 0.0), float(item.get("route_confidence", 0.0) or 0.0), float(item.get("structural_bonus", 0.0) or 0.0)), reverse=True)
+        ranked = sorted(route_results, key=lambda item: (float(item.get("memory_score", 0.0) or 0.0), float(item.get("structural_bonus", 0.0) or 0.0)), reverse=True)
         deduped = self.fusion_service.dedupe_route_results(ranked)
         for rank, item in enumerate(deduped[:top_k], start=1):
             item["route_rank"] = rank
@@ -1024,18 +1014,8 @@ class RouteRetriever:
         query_keywords: List[str],
         query_profile: QueryProfile,
     ) -> Dict[str, Any]:
-        """把定位到的 chunk 包装成 memory_context 路由结果；路由置信度上限 0.78，避免记忆证据压过新检索。"""
+        """把定位到的 chunk 包装成 memory_context 路由结果。"""
         memory_score = self.memory_candidate_score(candidate, chunk, query_keywords, query_profile)
-        route_confidence = min(
-            0.78,
-            self.route_confidence_builder(
-                "memory_context",
-                query_profile,
-                str(candidate.get("content_preview", "") or query_profile.original_query),
-                route_queries=[str(candidate.get("content_preview", "") or query_profile.original_query)],
-                intent_profile=query_profile.intent_profile,
-            ) + min(0.18, memory_score * 0.15),
-        )
         memory_chunk = dict(chunk)
         memory_chunk.update(
             {
@@ -1043,7 +1023,6 @@ class RouteRetriever:
                 "source_query": query_profile.original_query,
                 "route_score": float(memory_score),
                 "normalized_route_score": float(min(1.0, memory_score / 1.4)),
-                "route_confidence": float(route_confidence),
                 "structural_bonus": float(self.structural_bonus_builder(memory_chunk, query_profile)),
                 "memory_score": float(memory_score),
                 "memory_reason": str(candidate.get("memory_reason", "") or memory_context.get("reason", "")),
@@ -1060,12 +1039,11 @@ class RouteRetriever:
         results: List[Dict[str, Any]],
         route_name: str,
         source_query: str,
-        route_confidence: float,
         query_profile: QueryProfile,
         *,
         top_k: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """为原始命中补齐路由字段（名次、原始分、归一化分、置信度、结构加分），向量路由再做 index 聚合。"""
+        """为原始命中补齐路由字段（名次、原始分、归一化分、结构加分），向量路由再做 index 聚合。"""
         if not results:
             return []
         # 路由原始分是必填项：缺分说明上游返回结构变了，直接报错，不能当成 0 分继续排序。
@@ -1082,7 +1060,6 @@ class RouteRetriever:
             chunk["route_rank"] = rank
             chunk["route_score"] = raw_score
             chunk["normalized_route_score"] = float(normalized_score)
-            chunk["route_confidence"] = float(route_confidence)
             chunk["structural_bonus"] = float(self.structural_bonus_builder(chunk, query_profile))
             normalized.append(chunk)
         if route_name in VECTOR_ROUTE_NAMES:
@@ -1093,17 +1070,6 @@ class RouteRetriever:
                 top_k=top_k if top_k is not None else len(normalized),
             )
         return normalized
-
-    def heuristic_hyde_document(self, query_profile: QueryProfile, rewritten_queries: List[str]) -> str:
-        """无生成服务时的 HyDE 模板：把改写 query、偏好章节和原问题拼成一段“假想证据”。"""
-        focus = ", ".join(rewritten_queries[:2]) if rewritten_queries else query_profile.keyword_query
-        preferred_sections = ", ".join(query_profile.section_preferences[:3]) if query_profile.section_preferences else "relevant sections"
-        return (
-            "The paper likely contains a passage that answers the question with concrete evidence, terminology, "
-            f"and section-level details. The most useful chunk is probably near {preferred_sections}. "
-            f"Relevant terms may include: {focus}. The passage should help retrieve the specific evidence needed to answer: "
-            f"{query_profile.original_query}"
-        )
 
     # min-max 归一化；实现统一放在 numeric_utils，这里保留方法名供本类（self.normalize_scores）及外部调用方使用。
     normalize_scores = staticmethod(min_max_normalize)
@@ -1141,15 +1107,8 @@ class RouteRetriever:
             top_k=top_k,
         )
         raw_results = list(payload.get("results") or [])
-        route_confidence = self.route_confidence_builder(
-            "table_structured",
-            query_profile,
-            user_query,
-            route_queries=[user_query, query_profile.evidence_query, query_profile.keyword_query],
-            intent_profile=query_profile.intent_profile,
-        )
         return {
-            "results": self.normalize_route_results(raw_results, "table_structured", user_query, route_confidence, query_profile),
+            "results": self.normalize_route_results(raw_results, "table_structured", user_query, query_profile),
             "debug": payload.get("debug") or {},
         }
 
@@ -1174,7 +1133,7 @@ class RouteRetriever:
         doc_len = max(doc_length, 1)
         k1 = ENHANCED_RETRIEVAL_CONFIG["bm25_k1"]
         b = ENHANCED_RETRIEVAL_CONFIG["bm25_b"]
-        boost_tokens = {"method", "methods", "dataset", "datasets", "baseline", "ablation", "limitation", "limitations"}
+        boost_tokens = _BM25_BOOST_STEMS
         score = 0.0
         content_lower = content.lower()
         term_details: List[Dict[str, Any]] = []

@@ -23,19 +23,25 @@ from .rule_decision_policy import RuleDecisionPolicy
 
 logger = logging.getLogger(__name__)
 
-_DECISION_PROMPT = """You are the decision policy of a bounded evidence-research engine for single-paper QA.
-Given the research state and the FULL TEXT of every evidence candidate retrieved so far (figures are attached as images), choose exactly ONE next action. The gate will enforce budgets and validity; you should still respect the remaining budgets shown in the state.
-Rules:
-1. Return JSON only, no extra text before or after.
-2. Choose "finalize_answer" only when every claim assessment is "supported" and no core need is open.
-3. Read the retrieved evidence before judging coverage. Choose "abstain" only when, after reading it, the paper clearly does not contain what the question asks and no further search could find it. Never abstain for "insufficient evidence" while the retrieved evidence contains on-topic content for a core need (for example a method section or an architecture figure): draft instead.
-4. Need status stays "provisional"/"open" until a draft is verified; retrieval alone never changes it. Judge whether a need already has on-topic evidence by reading the candidates listed for it in "need_evidence" (its candidate_ids are source_ids in the evidence below), not from status.
-5. Drafting is how coverage gets confirmed: the draft is verified claim by claim and the verdicts show exactly what is still missing. If there is no draft yet and any core need already has on-topic evidence, choose "draft_answer" instead of searching again.
-6. Use "search_paper" only for a core need whose retrieved evidence does not actually cover it, or for a gap named by an unsupported claim assessment; the query must target the specific content still missing after reading the evidence, and differ from earlier queries.
-7. Never choose "search_paper" when "evidence_pool_full" is true or "retrievals_remaining" is 0: new candidates cannot enter the pool, so the search is wasted.
-8. Use "draft_answer" to (re)write the answer from current evidence; list the need ids it addresses.
-9. Evidence filtering: put the source_id of every retrieved candidate that is irrelevant to the question AND to all evidence needs into "discard_evidence_ids". Discarded candidates leave the pool and are never shown to the drafter again. Keep anything you are unsure about, use only source_ids that appear in the evidence below, and use [] when nothing is irrelevant.
-10. The action JSON schemas are:
+_DECISION_PROMPT = """You are the decision policy of a bounded evidence-research engine that answers one question about one paper.
+The goal is an answer that fully answers the research question, with every claim supported by the paper. Each turn you choose the ONE next action that brings the answer closest to that goal.
+
+What the research state means:
+- evidence_needs: the parts a complete answer has to cover ("core" ones are required). Status "provisional" = no verified draft has addressed it yet; "satisfied" = the latest verified draft has at least one supported claim for it; "open" = the latest draft addressed it but none of those claims was supported. One supported sentence is enough for "satisfied", so a satisfied need can still be covered only superficially; judge depth yourself against what the question asks.
+- need_evidence: which candidates were retrieved while targeting each need. This records the retrieval target only; a candidate may also contain content for other needs, so judge by reading the evidence.
+- latest_draft_claims: what the latest draft actually says, claim by claim, with the needs each claim addresses, the verifier's verdict, and the facets the verifier found missing.
+- The evidence below is only what has been retrieved so far, not the whole paper. If the question asks for something the evidence only touches on (for example a method whose details sit in sections not retrieved yet), the paper most likely contains more.
+- When the engine stops (budgets used up or no valid action), it delivers the best verified draft trimmed to its supported claims, so the last draft should be written from the best evidence you could gather.
+
+Actions:
+- search_paper: retrieve more passages from the paper for one core or supporting need whose status is "provisional" or "open". It adds new evidence and costs one retrieval. Write the query for the specific content still missing after reading the evidence, different from earlier queries. Not possible when retrievals_remaining is 0 or evidence_pool_full is true.
+- draft_answer: (re)write the answer from the current evidence, listing the need ids it addresses. The draft is then split into claims and each claim is verified against the evidence, which shows what is supported and what is missing. It costs one draft. Rewriting from unchanged evidence only helps when the latest verdicts point to something the drafter can fix with that evidence (a wrong citation, or content the evidence has but the draft left out); otherwise gather the missing evidence first. Not possible when drafts_remaining is 0.
+- finalize_answer: deliver the latest draft. Accepted only when every claim is supported and every core need is satisfied.
+- abstain: give up on the question. Only when, after reading the evidence, the paper clearly does not contain what the question asks and further search could not find it. Not while the evidence has on-topic content for a core need.
+
+Evidence filtering: put the source_id of every retrieved candidate that is irrelevant to the question AND to all evidence needs into "discard_evidence_ids". Discarded candidates leave the pool and are never shown to the drafter again. Keep anything you are unsure about, use only source_ids that appear in the evidence below, and use [] when nothing is irrelevant.
+
+Return JSON only, no extra text before or after, matching one of these schemas:
    {{"action": "search_paper", "target_need_id": "...", "objective": "discover|verify_claim|resolve_conflict|check_absence", "retrieval_mode": "broad|definition|method|experiment|comparison|numeric", "query": "...", "section_hints": [], "discard_evidence_ids": [], "reason_code": "..."}}
    {{"action": "draft_answer", "addressed_need_ids": ["..."], "discard_evidence_ids": [], "reason_code": "..."}}
    {{"action": "finalize_answer", "discard_evidence_ids": [], "reason_code": "..."}}
@@ -113,7 +119,9 @@ class LlmDecisionPolicy:
 
     def _compact_state(self, context: Any) -> dict[str, Any]:
         needs = list(getattr(context, "evidence_needs", []) or [])
-        assessments = list(getattr(context, "claim_assessments", []) or [])
+        assessment_by_claim = {
+            getattr(item, "claim_id", ""): item for item in getattr(context, "claim_assessments", []) or []
+        }
         return {
             "research_question": getattr(context, "research_question", ""),
             "evidence_needs": [
@@ -138,9 +146,17 @@ class LlmDecisionPolicy:
                 for item in getattr(context, "need_evidence", []) or []
             ],
             "current_draft_version": getattr(context, "current_draft_version", None),
-            "claim_assessments": [
-                {"claim_id": getattr(item, "claim_id", ""), "verdict": getattr(item, "verdict", "")}
-                for item in assessments
+            "latest_draft_claims": [
+                {
+                    "claim_id": getattr(claim, "claim_id", ""),
+                    "text": getattr(claim, "text", ""),
+                    "addressed_need_ids": list(getattr(claim, "addressed_need_ids", []) or []),
+                    "verdict": getattr(assessment_by_claim.get(getattr(claim, "claim_id", "")), "verdict", "unverified"),
+                    "missing_facets": list(
+                        getattr(assessment_by_claim.get(getattr(claim, "claim_id", "")), "missing_facets", []) or []
+                    ),
+                }
+                for claim in getattr(context, "claims", []) or []
             ],
             "retrievals_remaining": getattr(context, "retrievals_remaining", 0),
             "drafts_remaining": getattr(context, "drafts_remaining", 0),

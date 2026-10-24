@@ -24,6 +24,8 @@ class IntentDefinition:
     - is_search: 是否搜索类意图（决定是否解析结构化 search_spec）。
     - is_non_search_task: 是否属于"非搜索但带任务语义"的意图（旧 NON_SEARCH_INTENTS）。
     - minimum_requirements: 该意图最小可执行条件，供澄清 trace 解释"为何还不能继续"。
+    - llm_definition: 写进意图识别 prompt 的英文定义，按"用户要 Agent 做什么"描述类别边界，
+      模型据此分类，而不是只看标签名去匹配用户用词。
     """
 
     name: str
@@ -32,18 +34,46 @@ class IntentDefinition:
     is_search: bool
     is_non_search_task: bool
     minimum_requirements: Tuple[str, ...] = field(default_factory=tuple)
+    llm_definition: str = ""
 
 
 # 顺序即 LLM prompt 中列出 intent 的顺序，确保 prompt 文案可从配置稳定派生。
 _ORDERED_DEFINITIONS: Tuple[IntentDefinition, ...] = (
-    IntentDefinition("arxiv_search", "按主题/关键词搜索 arXiv 论文。", True, True, False, ("search_topic",)),
-    IntentDefinition("paper_detail", "解释某篇具体论文的方法/贡献/章节细节。", True, False, True, ("target_paper",)),
-    IntentDefinition("paper_summary", "总结/概述某篇具体论文。", True, False, True, ("target_paper",)),
-    IntentDefinition("paper_qa", "就某篇具体论文提出问题并基于全文回答。", True, False, True, ("target_paper", "user_question")),
-    IntentDefinition("recommendation", "基于用户画像/兴趣生成个性化论文推荐。", True, False, True, ("user_identity_or_profile_or_constraints",)),
-    IntentDefinition("preference_action", "对某篇论文执行喜欢/不喜欢/取消偏好。", True, False, True, ("preference_action", "preference_target", "user_identity")),
-    IntentDefinition("unclear", "想要论文相关能力但主题不够明确，需要澄清。", True, False, False, ("task_intent",)),
-    IntentDefinition("unsupported", "超出 arXiv 搜索 Agent 能力范围的请求。", True, False, False, tuple()),
+    IntentDefinition(
+        "arxiv_search", "按主题/关键词搜索 arXiv 论文。", True, True, False, ("search_topic",),
+        llm_definition="The user specifies what the papers should be about (a topic, task, problem, method or similar) "
+        "and wants papers matching it found on arXiv. Search results are also ranked with the user's research profile.",
+    ),
+    IntentDefinition(
+        "paper_detail", "解释某篇具体论文的方法/贡献/章节细节。", True, False, True, ("target_paper",),
+        llm_definition="About one specific paper: explain its method, contributions or a particular section.",
+    ),
+    IntentDefinition(
+        "paper_summary", "总结/概述某篇具体论文。", True, False, True, ("target_paper",),
+        llm_definition="About one specific paper: give an overall summary of it.",
+    ),
+    IntentDefinition(
+        "paper_qa", "就某篇具体论文提出问题并基于全文回答。", True, False, True, ("target_paper", "user_question"),
+        llm_definition="About one specific paper: answer a concrete question about its content from the full text.",
+    ),
+    IntentDefinition(
+        "recommendation", "基于用户画像/兴趣生成个性化论文推荐。", True, False, True, ("user_identity_or_profile_or_constraints",),
+        llm_definition="The user does not specify what the papers should be about and leaves the choice to the agent, "
+        "which picks papers according to the user's own research profile, interests or reading history.",
+    ),
+    IntentDefinition(
+        "preference_action", "对某篇论文执行喜欢/不喜欢/取消偏好。", True, False, True, ("preference_action", "preference_target", "user_identity"),
+        llm_definition="About one specific paper: mark it as liked, mark it as disliked / not interested, or cancel such a mark.",
+    ),
+    IntentDefinition(
+        "unclear", "想要论文相关能力但主题不够明确，需要澄清。", True, False, False, ("task_intent",),
+        llm_definition="The user wants papers or paper-related help, but the request is too vague to act on.",
+    ),
+    IntentDefinition(
+        "unsupported", "超出 arXiv 搜索 Agent 能力范围的请求。", True, False, False, tuple(),
+        llm_definition="Anything else, including saving/bookmarking papers, reading lists, read-later, listing saved papers, "
+        "and requests unrelated to papers.",
+    ),
     IntentDefinition("confirmation", "运行时等待用户确认/拒绝某个待执行动作。", False, False, False, ("confirmation_request", "confirmation_decision")),
 )
 
@@ -67,13 +97,9 @@ MINIMUM_EXECUTION_REQUIREMENTS: Dict[str, List[str]] = {
 # LLM prompt 中"可选 intent"的有序名单，prompt 从这里派生而非硬编码。
 LLM_INTENT_CHOICES: Tuple[str, ...] = tuple(definition.name for definition in _ORDERED_DEFINITIONS if definition.parse_selectable)
 
-# LLM 分类的跨意图判别规则，集中维护 prompt guidance 文案。
-LLM_CLASSIFICATION_GUIDANCE: Tuple[str, ...] = (
-    "If the user is asking to summarize/explain/QA a specific paper, do not classify as arxiv_search.",
-    "If the user is expressing like/dislike or cancelling like/dislike about a specific paper, classify as preference_action.",
-    "If the user asks to save/bookmark/add to a reading list/read later/list saved papers, classify as unsupported.",
-    "If the user is asking for personalized recommendations, classify as recommendation.",
-    "If the topic is too vague, classify as unclear.",
+# LLM prompt 中逐条列出的 intent 定义，与 LLM_INTENT_CHOICES 同序。
+LLM_INTENT_DEFINITIONS: Tuple[Tuple[str, str], ...] = tuple(
+    (definition.name, definition.llm_definition) for definition in _ORDERED_DEFINITIONS if definition.parse_selectable
 )
 
 
@@ -85,5 +111,5 @@ __all__ = [
     "NON_SEARCH_INTENTS",
     "MINIMUM_EXECUTION_REQUIREMENTS",
     "LLM_INTENT_CHOICES",
-    "LLM_CLASSIFICATION_GUIDANCE",
+    "LLM_INTENT_DEFINITIONS",
 ]

@@ -243,10 +243,8 @@ class _PreparedQueryView(NamedTuple):
     source: Any
     query: str
     weight: float
-    # 过滤停用词后的原始 token（只用于 debug 展示）。
+    # 过滤停用词后的 token，直接用于 BM25 检索。
     tokens: List[str]
-    # 同义词/缩写扩展后的 token，真正用于 BM25 检索。
-    expanded_tokens: List[str]
 
 
 class _KeywordRunState:
@@ -263,7 +261,6 @@ class _KeywordRunState:
         self.aggregated: Dict[int, Dict[str, Any]] = {}
         self.per_query_debug: List[Dict[str, Any]] = []
         self.original_query_tokens: List[str] = []
-        self.expanded_query_tokens: List[str] = []
 
     def record_view(
         self,
@@ -282,8 +279,6 @@ class _KeywordRunState:
         """
         for token in view.tokens:
             _append_unique(self.original_query_tokens, token)
-        for token in view.expanded_tokens:
-            _append_unique(self.expanded_query_tokens, token)
 
         if not rows:
             self.per_query_debug.append(self._view_debug_row(view, candidate_count=0, top_hits=[], error=error))
@@ -364,7 +359,6 @@ class _KeywordRunState:
             "source": view.source,
             "weight": view.weight,
             "query_tokens": view.tokens,
-            "expanded_tokens": view.expanded_tokens,
             "candidate_count": candidate_count,
             "top_hits": top_hits,
         }
@@ -389,12 +383,8 @@ class _KeywordRunState:
         return aggregate_keyword_index_hits_to_chunks(ranked, retrieval_index)
 
     def token_debug(self) -> Dict[str, Any]:
-        """汇总所有 view 的 query token，并标记同义词扩展是否真正引入了新词。"""
-        return {
-            "query_tokens": self.original_query_tokens,
-            "expanded_tokens": self.expanded_query_tokens,
-            "query_expansion_applied": bool(set(self.expanded_query_tokens) - set(self.original_query_tokens)),
-        }
+        """汇总所有 view 的 query token。"""
+        return {"query_tokens": self.original_query_tokens}
 
 
 class KeywordBackendResult:
@@ -429,14 +419,11 @@ class KeywordBackend(ABC):
         self,
         *,
         query_tools: Any,
-        route_confidence_builder: Any,
         structural_bonus_builder: Any,
         fusion_service: Any,
     ) -> None:
         # 提供分词、停用词过滤、同义词扩展、乱码 token 判断（通常是 QueryPlanner）。
         self.query_tools = query_tools
-        # 计算 keyword 路由的基础置信度（通常是 RetrievalRules.route_confidence）。
-        self.route_confidence_builder = route_confidence_builder
         # 计算 chunk 的结构加分（通常是 RetrievalRules.compute_structural_bonus）。
         self.structural_bonus_builder = structural_bonus_builder
         # 两个后端目前都不直接使用 fusion_service（跨路由融合在 route_retriever 之后完成），
@@ -473,7 +460,7 @@ class KeywordBackend(ABC):
         return _KeywordRunState(rrf_k=_route_retriever().keyword_rrf_k())
 
     def _prepare_query_view(self, query_view: Dict[str, Any]) -> Optional[_PreparedQueryView]:
-        """分词、过滤并扩展一条 query view；没有有效 token 或权重不为正时返回 None（跳过该 view）。"""
+        """分词并过滤一条 query view；没有有效 token 或权重不为正时返回 None（跳过该 view）。"""
         query = str(query_view.get("query", "") or "")
         raw_tokens = self.query_tools.tokenize_for_keyword_search(query)
         tokens = self._filter_keyword_query_tokens(raw_tokens)
@@ -488,7 +475,6 @@ class KeywordBackend(ABC):
             query=query,
             weight=query_weight,
             tokens=tokens,
-            expanded_tokens=self._expand_keyword_query_tokens(tokens),
         )
 
     def _finalize_keyword_retrieval(
@@ -518,16 +504,13 @@ class KeywordBackend(ABC):
             debug["matched_chunks"] = []
             return [], debug
 
-        base_route_confidence = self._compute_base_confidence(query_views, query_profile)
         results = self._build_keyword_results(
             ranked=ranked,
             top_k=top_k,
-            base_route_confidence=base_route_confidence,
             query_profile=query_profile,
             retrieval_index=retrieval_index,
         )
         debug["keyword_rrf_k"] = state.rrf_k
-        debug["base_route_confidence"] = float(base_route_confidence)
         debug["matched_chunks"] = self._build_matched_chunks_debug(ranked[:top_k], retrieval_index, query_profile)
         return results, debug
 
@@ -536,7 +519,6 @@ class KeywordBackend(ABC):
         *,
         ranked: List[tuple],
         top_k: int,
-        base_route_confidence: float,
         query_profile: Any,
         retrieval_index: Any,
     ) -> List[Dict[str, Any]]:
@@ -569,19 +551,12 @@ class KeywordBackend(ABC):
                 query_profile=query_profile,
                 chunk=chunk,
             )
-            route_confidence = self._adjust_keyword_route_confidence(
-                base_route_confidence,
-                matched_terms=matched_terms,
-                noise_flags=noise_flags,
-                query_profile=query_profile,
-            )
 
             chunk["retrieval_route"] = "keyword"
             chunk["source_query"] = " | ".join([item["query"] for item in query_contributions[:3]])
             chunk["route_rank"] = rank
             chunk["route_score"] = fusion_score
             chunk["normalized_route_score"] = float(normalized_score)
-            chunk["route_confidence"] = float(route_confidence)
             chunk["structural_bonus"] = float(self.structural_bonus_builder(chunk, query_profile))
             chunk["keyword_match_fields"] = main_fields
             chunk["keyword_hit_asset_field"] = any(field in _ASSET_FIELDS for field in main_fields)
@@ -592,7 +567,6 @@ class KeywordBackend(ABC):
             chunk["keyword_matched_terms"] = matched_terms
             chunk["keyword_query_sources"] = query_sources
             chunk["keyword_noise_flags"] = noise_flags
-            chunk["keyword_base_route_confidence"] = float(base_route_confidence)
             # 对外仍是 chunk 候选；index 字段只说明本次 BM25 最强的命中入口，top 列表留给 rerank/debug。
             chunk["retrieval_index_id"] = top_index.get("index_id", document.retrieval_index_id)
             chunk["retrieval_index_type"] = top_index.get("index_type", document.retrieval_index_type)
@@ -613,16 +587,6 @@ class KeywordBackend(ABC):
             results.append(chunk)
 
         return results
-
-    def _compute_base_confidence(self, query_views: List[Dict[str, Any]], query_profile: Any) -> float:
-        """计算 keyword 路由的基础置信度；没有 query view 时退回原始查询和关键词查询。"""
-        return self.route_confidence_builder(
-            "keyword",
-            query_profile,
-            " | ".join([row["query"] for row in query_views]) if query_views else query_profile.original_query,
-            route_queries=[row["query"] for row in query_views] or [query_profile.keyword_query],
-            intent_profile=query_profile.intent_profile,
-        )
 
     def _build_matched_chunks_debug(
         self, ranked: List[tuple], retrieval_index: Any, query_profile: Any
@@ -668,13 +632,6 @@ class KeywordBackend(ABC):
         """兼容旧调用名，等价于模块函数 build_keyword_matched_terms。"""
         return build_keyword_matched_terms(term_traces)
 
-    def _expand_keyword_query_tokens(self, tokens: List[str]) -> List[str]:
-        """调用 query_tools 做同义词/缩写扩展；query_tools 未提供该能力时原样返回。"""
-        expander = getattr(self.query_tools, "expand_keyword_query_tokens", None)
-        if callable(expander):
-            return expander(tokens)
-        return tokens
-
     def _filter_keyword_query_tokens(self, tokens: List[str]) -> List[str]:
         """调用 query_tools 过滤停用词、保留关键词（limit 设为 token 数，即只过滤不截断）。"""
         extractor = getattr(self.query_tools, "extract_query_keywords", None)
@@ -697,22 +654,6 @@ class KeywordBackend(ABC):
             query_profile=query_profile,
             chunk=chunk,
             is_informative_token=self._is_informative_token,
-        )
-
-    def _adjust_keyword_route_confidence(
-        self,
-        base_confidence: float,
-        *,
-        matched_terms: List[Dict[str, Any]],
-        noise_flags: List[str],
-        query_profile: Any,
-    ) -> float:
-        """按意图、最高 IDF 和噪声标记调整基础置信度，规则复用 RouteRetriever。"""
-        return _route_retriever().adjust_keyword_route_confidence(
-            base_confidence,
-            matched_terms=matched_terms,
-            noise_flags=noise_flags,
-            query_profile=query_profile,
         )
 
     def _is_informative_token(self, token: str) -> bool:
@@ -775,7 +716,7 @@ class InternalBM25Backend(KeywordBackend):
             if view is None:
                 continue
             rows = self._score_candidates(
-                view.expanded_tokens,
+                view.tokens,
                 field_weights=field_weights,
                 query_profile=query_profile,
                 retrieval_index=retrieval_index,

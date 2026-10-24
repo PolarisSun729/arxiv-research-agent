@@ -75,7 +75,8 @@ RETRIEVAL_INDEX_ARTIFACT_SCHEMA_VERSION = "retrieval_index_artifact_v1"
 DEFAULT_RETRIEVAL_INDEX_ARTIFACT_DIR = "02-retrieval-indexes"
 SPARSE_INDEX_ARTIFACT_SCHEMA_VERSION = "sparse_index_artifact_v1"
 BM25_SCHEMA_VERSION = "field_weighted_bm25_v1"
-KEYWORD_TOKENIZER_VERSION = "retrieval_rules_keyword_tokenizer_v1"
+# v2：英文 token 做 Snowball 词干化、中文不再按词表切分；版本不一致的持久化 sparse 索引不能复用。
+KEYWORD_TOKENIZER_VERSION = "retrieval_rules_keyword_tokenizer_v2"
 KEYWORD_FIELD_WEIGHTS_VERSION = "keyword_field_weights_v1"
 DEFAULT_SPARSE_INDEX_ARTIFACT_DIR = "02-sparse-indexes"
 SPARSE_SOURCE_TYPES = {"chunk", "retrieval_index"}
@@ -410,7 +411,7 @@ class RetrievalIndexBuilder:
         summary_text, summary_status, summary_errors = self._summary_text(chunk, paper_chunk, metadata)
         generation_errors.extend(summary_errors)
         if summary_text and self._normalized_text(summary_text) != self._normalized_text(body_text):
-            add_index("summary", summary_text, source_fields=["rerank_text", "asset_summary", "generated_summary"], generation_status=summary_status)
+            add_index("summary", summary_text, source_fields=["generated_summary"], generation_status=summary_status)
             if summary_status == "generated_llm":
                 generated_summary_count += 1
             if summary_status == "cached_llm":
@@ -446,12 +447,10 @@ class RetrievalIndexBuilder:
     ) -> tuple[str, str, List[Dict[str, Any]]]:
         """返回 (摘要文本, 来源状态, 生成错误)。
 
-        优先复用 chunk 已有的 rerank_text / asset_summary；否则在开启生成式索引时查缓存或调用 LLM，
-        LLM 无结果或失败时退回正文截断（generated_fallback）。
+        开启生成式索引时查缓存或调用 LLM 生成检索用摘要。不复用 rerank 卡片（rerank_text）：
+        它是给 rerank 看的结构化提示，带规则推断的「用途」字样，放进向量索引会让很多 chunk 都贴近同类问题。
+        LLM 无结果或失败时不出 summary 索引，正文截断与 body 索引重复，没有额外召回价值。
         """
-        existing = str(chunk.get("rerank_text") or metadata.get("rerank_text") or metadata.get("asset_summary") or "").strip()
-        if existing:
-            return existing, "reused_existing", []
         if not self.enable_generative_indexes:
             return "", "disabled", []
         cache_kwargs = {
@@ -471,11 +470,11 @@ class RetrievalIndexBuilder:
                 self._set_cached_generation(cache_kwargs, generated)
                 return generated, "generated_llm", []
         except Exception as exc:
-            # 生成失败只降级当前 chunk 的增强索引，规则索引已经足够维持后续 embedding/BM25 流程。
-            return self._short_text(paper_chunk.content), "generated_fallback", [
+            # 生成失败只少一个增强索引，body 等规则索引已经足够维持后续 embedding/BM25 流程。
+            return "", "generation_failed", [
                 {"chunk_id": paper_chunk.chunk_id, "index_type": "summary", "error": str(exc)[:300]}
             ]
-        return self._short_text(paper_chunk.content), "generated_fallback", []
+        return "", "generation_failed", []
 
     def _question_texts(
         self,
@@ -483,7 +482,7 @@ class RetrievalIndexBuilder:
         paper_chunk: PaperChunk,
         metadata: Dict[str, Any],
     ) -> tuple[List[str], str, List[Dict[str, Any]]]:
-        """返回 (问题列表, 来源状态, 生成错误)，策略同 _summary_text；失败时退回模板问题。"""
+        """返回 (问题列表, 来源状态, 生成错误)；chunk 自带问题时直接复用，否则同 _summary_text，失败时不出 question 索引。"""
         existing_questions = extract_question_index_texts(chunk)
         if existing_questions:
             return self._dedupe_texts(existing_questions), "reused_existing", []
@@ -507,12 +506,11 @@ class RetrievalIndexBuilder:
                 self._set_cached_generation(cache_kwargs, normalized)
                 return normalized, "generated_llm", []
         except Exception as exc:
-            # 问题索引是可选召回视角；失败时用可解释模板问题兜底，并把错误写进 debug。
-            fallback = self._fallback_questions(paper_chunk, metadata)
-            return fallback, "generated_fallback", [
+            # 问题索引是可选召回视角；模板问题对所有 chunk 都差不多，兜底反而制造噪声，失败只记错误。
+            return [], "generation_failed", [
                 {"chunk_id": paper_chunk.chunk_id, "index_type": "question", "error": str(exc)[:300]}
             ]
-        return self._fallback_questions(paper_chunk, metadata), "generated_fallback", []
+        return [], "generation_failed", []
 
     def _get_cached_generation(self, cache_kwargs: Dict[str, Any]) -> Any:
         """读生成缓存；未配置缓存或缓存不支持读取时返回 None。"""
@@ -568,6 +566,7 @@ class RetrievalIndexBuilder:
         """摘要生成 prompt：任务说明 + chunk 上下文。"""
         return (
             "请为论文 QA 检索索引生成一个短摘要，必须只基于给定 chunk，不要补充外部信息。\n"
+            "摘要使用与 chunk content 相同的语言书写（content 是英文就写英文）。\n"
             "输出严格 JSON：{\"summary\":\"...\"}\n"
             + self._prompt_context(paper_chunk, metadata)
         )
@@ -577,6 +576,7 @@ class RetrievalIndexBuilder:
         return (
             "请为论文 QA 检索索引生成 1-3 个这个 chunk 可以回答的问题。\n"
             "要求：问题必须具体、可由该 chunk 直接支持；不要生成无法从 chunk 证明的问题。\n"
+            "问题使用与 chunk content 相同的语言书写（content 是英文就写英文）。\n"
             "输出严格 JSON：{\"questions\":[\"...\",\"...\"]}\n"
             + self._prompt_context(paper_chunk, metadata)
         )
@@ -666,27 +666,6 @@ class RetrievalIndexBuilder:
             f"Chunk: {paper_chunk.chunk_id}" if not summary and not metadata.get("section_path") and not metadata.get("section_title") else "",
         ]
         return "\n".join([part for part in parts if part]).strip() or f"Chunk: {paper_chunk.chunk_id}"
-
-    def _fallback_questions(self, paper_chunk: PaperChunk, metadata: Dict[str, Any]) -> List[str]:
-        """LLM 不可用时按 chunk 类型套用的模板问题，以章节名作为主题。"""
-        chunk_type = str(metadata.get("chunk_type", "text") or "text").strip().lower()
-        topic = str(metadata.get("section_title") or metadata.get("section_path") or "this evidence").strip()
-        if chunk_type == "figure":
-            questions = [
-                f"What does the figure show about {topic}?",
-                "How should the figure evidence be interpreted in this paper?",
-            ]
-        elif chunk_type == "table":
-            questions = [
-                f"What results are reported in the table for {topic}?",
-                "Which values or comparisons does the table support?",
-            ]
-        else:
-            questions = [
-                f"What does the paper say about {topic}?",
-                f"How does this chunk support questions about {topic}?",
-            ]
-        return self._dedupe_texts(questions)[: self.max_questions_per_chunk]
 
     @staticmethod
     def _short_text(text: str, limit: int = RETRIEVAL_INDEX_PREVIEW_CHARS) -> str:

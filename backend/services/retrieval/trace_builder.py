@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from services.retrieval.contracts import QueryProfile
 from services.retrieval.numeric_utils import first_float
+from services.retrieval.result_fusion_service import ResultFusionService
 from services.retrieval.table_evidence_formatter import summarize_table_evidence_debug
 from utils.config import get_enhanced_retrieval_runtime_config
 from utils.secret_redaction import redact_sensitive_value
@@ -37,14 +38,12 @@ class RetrievalTraceBuilder:
         trace_export_dir: Path,
         rrf_k: int,
         route_weights: Dict[str, float],
-        route_confidence_builder: Any,
         route_weights_builder: Any,
     ) -> None:
         self.trace_export_enabled = trace_export_enabled
         self.trace_export_dir = trace_export_dir
         self.rrf_k = rrf_k
         self.route_weights = dict(route_weights or {})
-        self.route_confidence_builder = route_confidence_builder
         self.route_weights_builder = route_weights_builder
 
     def build_debug(
@@ -98,7 +97,6 @@ class RetrievalTraceBuilder:
             "original_question": user_query,
             "intent_profile": self.debug_intent_profile(intent_profile),
             "query_profile": self.debug_query_profile(query_profile),
-            "query_plan": query_profile.query_plan,
             "query_views": query_views,
             "rewritten_queries": query_views["selected_queries"],
             "rerank_query": rerank_query,
@@ -144,16 +142,6 @@ class RetrievalTraceBuilder:
                 "rrf_k": self.rrf_k,
                 "route_weights": self.route_weights_builder(intent_profile),
                 "dedupe_per_route": True,
-                "route_confidence": {
-                    route_name: self.route_confidence_builder(
-                        route_name,
-                        query_profile,
-                        (route_results[0]["source_query"] if route_results else user_query),
-                        route_queries=self.collect_route_queries(route_results, query_views["selected_queries"], user_query),
-                        intent_profile=intent_profile,
-                    )
-                    for route_name, route_results in routes.items()
-                },
             },
             "llm_rerank": rerank_debug,
             "context_expansion": context_expansion,
@@ -300,18 +288,14 @@ class RetrievalTraceBuilder:
         return {
             "original_query": query_profile.original_query,
             "normalized_query": query_profile.normalized_query,
+            "retrieval_query": query_profile.retrieval_query,
             "language": query_profile.language,
             "intent_profile": self.debug_intent_profile(query_profile.intent_profile),
             "tokens": query_profile.tokens,
             "keywords": query_profile.keywords,
             "intent_tags": query_profile.intent_tags,
-            "paper_terms": query_profile.paper_terms,
             "ambiguity_score": query_profile.ambiguity_score,
-            "semantic_query": query_profile.semantic_query,
-            "evidence_query": query_profile.evidence_query,
-            "keyword_query": query_profile.keyword_query,
             "section_preferences": query_profile.section_preferences,
-            "query_plan": query_profile.query_plan,
         }
 
     def debug_intent_profile(self, intent_profile: Any) -> Optional[Dict[str, Any]]:
@@ -381,19 +365,18 @@ class RetrievalTraceBuilder:
             "score": item.get("score"),
             "route_score": item.get("route_score"),
             "normalized_route_score": item.get("normalized_route_score"),
-            "route_confidence": item.get("route_confidence"),
             "structural_bonus": item.get("structural_bonus"),
             "retrieval_route": item.get("retrieval_route"),
             "route_rank": item.get("route_rank"),
             "matched_routes": item.get("matched_routes", []),
             "route_scores": item.get("route_scores", {}),
+            "rrf_votes": item.get("rrf_votes", {}),
             "source_query": item.get("source_query"),
             "source_queries": item.get("source_queries", []),
             # keyword route 的 BM25 可解释字段，便于在 debug 里直接看到“为什么召回”。
             "bm25_raw_score": item.get("bm25_raw_score"),
             "bm25_fused_score": item.get("bm25_fused_score"),
             "keyword_best_raw_bm25_score": item.get("keyword_best_raw_bm25_score"),
-            "keyword_base_route_confidence": item.get("keyword_base_route_confidence"),
             "keyword_match_fields": item.get("keyword_match_fields", []),
             "keyword_matched_terms": item.get("keyword_matched_terms", []),
             "keyword_query_sources": item.get("keyword_query_sources", []),
@@ -482,32 +465,9 @@ class RetrievalTraceBuilder:
                 )
 
     @staticmethod
-    def collect_route_queries(
-        route_results: List[Dict[str, Any]],
-        fallback_queries: List[str],
-        user_query: str,
-    ) -> List[str]:
-        """某路由实际使用过的查询（取各结果的 source_query）；没有记录时退回改写查询或原问题。"""
-        queries = [item.get("source_query", "") for item in route_results if item.get("source_query")]
-        if queries:
-            return queries
-        return fallback_queries or [user_query]
-
-    @staticmethod
     def chunk_unique_key(item: Dict[str, Any]) -> str:
-        """chunk 的稳定唯一键：由类型、资产路径、来源、原始 chunk ID、分片标签、页码和顺序拼成。"""
-        return "|".join(
-            [
-                str(item.get("chunk_type", "text")),
-                str(item.get("asset_kind", "")),
-                str(item.get("asset_path", "")),
-                str(item.get("source", "")),
-                str(item.get("original_chunk_id", item.get("parent_chunk_id", item.get("chunk_id", 0)))),
-                str(item.get("content_part_label", "")),
-                str(item.get("page_range", "")),
-                str(item.get("order_index", "")),
-            ]
-        )
+        """chunk 的稳定唯一键，直接用融合去重的同一份实现，保证 trace、上下文扩展与融合判定一致。"""
+        return ResultFusionService.chunk_unique_key(item)
 
     @staticmethod
     def build_sparse_index_debug(keyword_debug: Optional[Dict[str, Any]]) -> Dict[str, Any]:

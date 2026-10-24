@@ -33,17 +33,12 @@ class _KeywordQueryTools:
         return list(tokens)[:limit]
 
     @staticmethod
-    def expand_keyword_query_tokens(tokens: list[str]) -> list[str]:
-        return list(dict.fromkeys(tokens))
-
-    @staticmethod
     def is_informative_keyword_token(token: str) -> bool:
         return len(str(token or "").strip()) > 1
 
 def _keyword_query_profile(query: str) -> SimpleNamespace:
     return SimpleNamespace(
         original_query=query,
-        keyword_query=query,
         intent_tags=[],
         intent_profile=SimpleNamespace(main_intent="other"),
     )
@@ -52,7 +47,6 @@ def _keyword_query_profile(query: str) -> SimpleNamespace:
 def _make_internal_bm25_backend() -> InternalBM25Backend:
     return InternalBM25Backend(
         query_tools=_KeywordQueryTools(),
-        route_confidence_builder=lambda *_args, **_kwargs: 0.7,
         structural_bonus_builder=lambda *_args, **_kwargs: 0.0,
         fusion_service=None,
     )
@@ -93,7 +87,8 @@ def test_build_retrieval_indexes_keeps_body_index_and_stable_ids() -> None:
     second = build_retrieval_indexes([chunk])
 
     assert [item["index_id"] for item in first] == [item["index_id"] for item in second]
-    assert {item["index_type"] for item in first} >= {"body", "section_anchor", "summary", "question"}
+    # rerank 卡片不再复用为 summary 索引；chunk 自带的问题仍直接复用。
+    assert {item["index_type"] for item in first} == {"body", "section_anchor", "question"}
     body = next(item for item in first if item["index_type"] == "body")
     assert body["chunk_id"] == "chunk-method"
     assert body["index_text"] == chunk["content"]
@@ -144,6 +139,26 @@ def test_generative_indexes_can_add_summary_and_questions() -> None:
     assert debug["generated_question_count"] == 2
     assert debug["generation_error_count"] == 0
     assert next(item for item in indexes if item["index_type"] == "summary")["index_text"].startswith("This chunk")
+
+
+def test_summary_index_is_generated_instead_of_reusing_rerank_card() -> None:
+    generation_service = _JsonGenerationService()
+    indexes, _debug = build_retrieval_index_payload(
+        [
+            {
+                "content": "The retriever is trained with contrastive learning over positive and negative passages.",
+                "metadata": {"chunk_id": "chunk-training", "chunk_type": "text", "section_title": "Retriever Training"},
+                "rerank_text": "Likely role: method. Useful for: method, framework, component, or pipeline questions.",
+            }
+        ],
+        generation_service=generation_service,
+        enable_generative_indexes=True,
+    )
+
+    summary = next(item for item in indexes if item["index_type"] == "summary")
+    assert summary["index_text"] == "This chunk describes contrastive retrieval training."
+    # 生成 prompt 要求与 chunk 内容同语言，避免英文论文生成中文问题/摘要。
+    assert all("相同的语言" in call["prompt"] for call in generation_service.calls)
 
 
 def test_generative_indexes_reuse_cached_summary_and_questions(tmp_path: Path) -> None:
@@ -235,7 +250,8 @@ def test_generative_failure_keeps_rule_indexes_and_records_debug() -> None:
     assert {"body", "section_anchor"} <= index_types
     assert debug["generation_error_count"] == 2
     assert all(item["chunk_id"] == "chunk-fallback" for item in indexes)
-    assert any(item["index_type"] == "question" for item in indexes)
+    # 生成失败不再用正文截断或模板问题兜底。
+    assert index_types == {"body", "section_anchor"}
 
 
 def test_asset_chunk_prioritizes_caption_summary_preview_for_indexes() -> None:

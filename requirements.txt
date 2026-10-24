@@ -24,6 +24,8 @@ pymilvus>=2.6,<3
 milvus-lite>=3.2,<4
 pypinyin>=0.55,<1
 bm25s>=0.3.9,<0.4
+# 关键词检索分词的 Snowball 英文词干化（建索引与查询共用）。
+PyStemmer>=3.0,<4
 diskcache>=5.6,<6
 scikit-learn>=1.8,<2
 numpy>=2.4,<3

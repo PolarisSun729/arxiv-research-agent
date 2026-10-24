@@ -48,7 +48,6 @@ const qaIndexJob = ref<QaIndexJobResult | null>(null)
 const qaJobPolling = ref(false)
 // 连续轮询失败次数，用于退避和提示“正在重试”。
 const qaJobPollFailures = ref(0)
-const loadingMethod = ref<'pymupdf' | 'docling'>('docling')
 const qaStatus = ref<QaStatusResult | null>(null)
 const qaDiagnostic = ref<QaDiagnosticResult | null>(null)
 const traceDownloading = ref(false)
@@ -93,6 +92,9 @@ const quickPrompts = computed(() => [
 
 const hasQaIndex = computed(() => Boolean(qaStatus.value?.has_index))
 const hasActiveQaJob = computed(() => ['pending', 'running'].includes(String(qaIndexJob.value?.status || '')))
+// 任务块只展示构建过程：进行中显示进度，失败显示原因。索引是否可用只看索引状态，
+// 成功的任务只是历史记录（索引之后可能已被删除或替换），不再展示。
+const showQaJobStatus = computed(() => hasActiveQaJob.value || qaIndexJob.value?.status === 'failed')
 const chatTurns = computed(() => qaResults.value)
 const ragChatMessages = computed(() => chatTurns.value.flatMap(qaTurnToRagMessages))
 // Milvus 存的是 RetrievalIndex 向量（非原始 chunk），核对基准是后端按入库规则算出的预期向量数。
@@ -103,8 +105,6 @@ const vectorCountCheck = computed(() => {
   const diff = (checks.expected_vector_count ?? 0) - (checks.milvus_num_entities ?? 0)
   return { ok: false, text: diff > 0 ? `缺 ${diff} 条` : `多 ${-diff} 条` }
 })
-const loadingMethodLabel = computed(() => (loadingMethod.value === 'docling' ? 'Docling' : 'PyMuPDF'))
-const loadingMethodHint = computed(() => (loadingMethod.value === 'docling' ? '更适合论文结构' : '保留传统解析'))
 const qaJobStatusText = computed(() => {
   const status = String(qaIndexJob.value?.status || '').trim().toLowerCase()
   if (status === 'pending') return '等待开始'
@@ -367,7 +367,7 @@ async function handleCreateIndex() {
 
   creatingIndex.value = true
   try {
-    const result = await createPaperQaIndex(paperId.value, loadingMethod.value)
+    const result = await createPaperQaIndex(paperId.value)
     if (result.job_id) {
       qaIndexJob.value = {
         job_id: result.job_id,
@@ -375,7 +375,7 @@ async function handleCreateIndex() {
         status: result.job_status || 'pending',
         current_stage: result.current_stage || 'pending',
         progress: typeof result.progress === 'number' ? result.progress : 0,
-        loading_method: result.loading_method || loadingMethod.value,
+        loading_method: result.loading_method || 'docling',
         error_message: null
       }
       ElMessage.success('问答索引任务已提交，正在后台构建')
@@ -586,27 +586,16 @@ watch(paperId, async () => {
               :loading="creatingIndex"
               @click="handleAskPaper"
             >
-              {{ creatingIndex ? '提交索引任务中...' : (hasActiveQaJob ? `索引构建中 · ${qaJobStatusText}` : `开始问答 · ${loadingMethodLabel}`) }}
+              {{ creatingIndex ? '提交索引任务中...' : (hasActiveQaJob ? `索引构建中 · ${qaJobStatusText}` : '开始问答') }}
             </el-button>
             <a :href="store.currentPaper.absUrl" target="_blank" rel="noopener" class="action-link">
               <el-button size="large" class="action-button" :icon="Link">查看 arXiv 原文</el-button>
             </a>
           </div>
 
-          <div v-if="canResearch" class="aside-block">
-            <div class="aside-label">
-              <span>PDF 解析方式</span>
-              <span class="muted">{{ loadingMethodHint }}</span>
-            </div>
-            <el-radio-group v-model="loadingMethod" class="parser-segment" :disabled="creatingIndex || hasActiveQaJob" size="small">
-              <el-radio-button label="docling">Docling</el-radio-button>
-              <el-radio-button label="pymupdf">PyMuPDF</el-radio-button>
-            </el-radio-group>
-          </div>
-
-          <div v-if="qaIndexJob" class="aside-block job-status">
+          <div v-if="qaIndexJob && showQaJobStatus" class="aside-block job-status">
             <div class="job-status-head">
-              <span :class="['chip', qaIndexJob.status === 'success' ? 'chip--success' : (qaIndexJob.status === 'failed' ? 'chip--danger' : 'chip--warning')]">
+              <span :class="['chip', qaIndexJob.status === 'failed' ? 'chip--danger' : 'chip--warning']">
                 {{ qaJobStatusText }}
               </span>
               <span class="muted">{{ qaStageText }}</span>
@@ -614,7 +603,7 @@ watch(paperId, async () => {
             <el-progress
               :percentage="Number(qaIndexJob.progress || 0)"
               :stroke-width="6"
-              :status="qaIndexJob.status === 'failed' ? 'exception' : (qaIndexJob.status === 'success' ? 'success' : undefined)"
+              :status="qaIndexJob.status === 'failed' ? 'exception' : undefined"
             />
             <div v-if="qaIndexJob.error_message" class="job-error-text">{{ qaIndexJob.error_message }}</div>
             <div v-else-if="qaJobPollFailures > 0" class="muted">暂时无法获取最新进度，正在重试…</div>
@@ -623,7 +612,7 @@ watch(paperId, async () => {
           <div v-if="qaStatus" class="status-note">
             <el-icon><Compass /></el-icon>
             <span>
-              {{ qaStatus.has_index ? `索引已完成，${qaStatus.chunk_count || 0} 个片段可供检索` : canResearch ? `先创建索引，默认解析方式：${loadingMethodLabel}` : '请联系研究者或管理员创建问答索引' }}
+              {{ qaStatus.has_index ? `索引已完成，${qaStatus.chunk_count || 0} 个片段可供检索` : canResearch ? '先创建索引' : '请联系研究者或管理员创建问答索引' }}
             </span>
           </div>
 
@@ -1088,19 +1077,6 @@ watch(paperId, async () => {
 
 .action-link {
   display: block;
-}
-
-.parser-segment {
-  display: flex;
-  width: 100%;
-}
-
-.parser-segment :deep(.el-radio-button) {
-  flex: 1;
-}
-
-.parser-segment :deep(.el-radio-button__inner) {
-  width: 100%;
 }
 
 .job-status-head {

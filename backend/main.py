@@ -27,12 +27,13 @@ from dependencies import (
     normalize_service_load_mode,
     warm_up_services,
 )
+from routers.admin_index_router import router as admin_index_router
+from routers.admin_retrieval_debug_router import router as admin_retrieval_debug_router
 from routers.agent_router import router as agent_router
 from routers.arxiv_router import router as arxiv_router
 from routers.paper_router import router as paper_router
 from routers.qa_router import router as qa_router
 from routers.user_router import router as user_router
-from utils.config import get_debug_routes_runtime_config
 from utils.logging_utils import configure_backend_logging, info_event
 from utils.startup_report import log_startup_report
 from middleware.audit_log import AuditLogMiddleware, AuditSink
@@ -50,7 +51,7 @@ def _uvicorn_log_level(level_name: str | None) -> str:
     return normalized if normalized in {"critical", "error", "warning", "info", "debug", "trace"} else "info"
 
 
-def create_app(load_mode: str | None = None, *, enable_debug_routes: bool | None = None) -> FastAPI:
+def create_app(load_mode: str | None = None) -> FastAPI:
     # 模式在启动时固定，JWT 不会因为配置了旧 API Key 就跳过账号权限。
     mode = auth_mode()
     security_settings = ApiKeySettings.from_environment() if mode == "api_key" else ApiKeySettings((), get_allowed_origins())
@@ -64,12 +65,6 @@ def create_app(load_mode: str | None = None, *, enable_debug_routes: bool | None
     rate_controller = RateLimitController(rate_limit_settings)
     audit_sink = AuditSink()
     resolved_load_mode = normalize_service_load_mode(load_mode)
-    debug_route_config = get_debug_routes_runtime_config()
-    resolved_enable_debug_routes = (
-        bool(debug_route_config.get("enable_debug_routes"))
-        if enable_debug_routes is None
-        else bool(enable_debug_routes)
-    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -81,7 +76,6 @@ def create_app(load_mode: str | None = None, *, enable_debug_routes: bool | None
             logger,
             load_mode=resolved_load_mode,
             auth_mode=mode,
-            debug_routes_enabled=resolved_enable_debug_routes,
             jwt_settings=jwt_settings,
             api_key_count=len(security_settings.key_hashes),
             allowed_origins=security_settings.allowed_origins,
@@ -238,14 +232,8 @@ def create_app(load_mode: str | None = None, *, enable_debug_routes: bool | None
     app.include_router(user_router, prefix="/api", dependencies=api_dependencies)
     app.include_router(paper_router, prefix="/api", dependencies=api_dependencies)
     app.include_router(qa_router, prefix="/api", dependencies=api_dependencies)
-    if resolved_enable_debug_routes:
-        # chunk debug 会暴露本地解析产物，只有显式开启调试路由时才挂载到内部 debug 前缀。
-        from routers.chunk_router import router as chunk_debug_router
-
-        app.include_router(chunk_debug_router, prefix="/api", dependencies=api_dependencies)
-        info_event(logger, "backend.debug_routes", enabled=True, route="/api/debug/chunks")
-    else:
-        info_event(logger, "backend.debug_routes", enabled=False)
+    app.include_router(admin_index_router, prefix="/api", dependencies=api_dependencies)
+    app.include_router(admin_retrieval_debug_router, prefix="/api", dependencies=api_dependencies)
 
     @app.get("/api/auth/check", dependencies=api_dependencies)
     async def check_access_key():
