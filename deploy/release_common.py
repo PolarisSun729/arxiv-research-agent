@@ -38,7 +38,10 @@ SHARED_DIRECTORIES = (
 EXPECTED_RUNTIME = {"system": "Linux", "distribution": "debian", "version": "12", "python": "3.11", "machine": "x86_64"}
 # systemd 直接 exec 的脚本。解压只保留归档里的可执行位，Git 里记成 100644 时
 # 服务器上就是 644，定时任务会以 203/EXEC 失败，所以打包和安装时都要拦下来。
-EXECUTABLE_ENTRYPOINTS = ("backend/07-arxiv-tools/sync_arxiv_oai_since_last_run.sh",)
+EXECUTABLE_ENTRYPOINTS = (
+    "backend/07-arxiv-tools/sync_arxiv_oai_since_last_run.sh",
+    "backend/07-arxiv-tools/compact_milvus_lite.sh",
+)
 
 
 class ReleaseError(RuntimeError):

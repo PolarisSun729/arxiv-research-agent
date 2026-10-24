@@ -1,0 +1,18 @@
+# 每日定时触发 arxiv-milvus-compact.service 的 systemd 定时器。
+#
+# 安装与启用：
+#   sudo install -o root -g root -m 644 deploy/arxiv-milvus-compact.timer /etc/systemd/system/arxiv-milvus-compact.timer
+#   sudo systemctl daemon-reload && sudo systemctl enable --now arxiv-milvus-compact.timer
+# 查看下次触发时间：systemctl list-timers arxiv-milvus-compact.timer
+
+[Unit]
+Description=Daily Milvus Lite offline compaction
+
+[Timer]
+# 每天 04:30（服务器本地时区）：排在 03:30 的 OAI 同步和随后的论文向量窗口清理之后，
+# 当天删掉的旧论文向量当天就被清掉。错过的一次不补跑（不设 Persistent），免得开机后马上停服务。
+OnCalendar=*-*-* 04:30:00
+Unit=arxiv-milvus-compact.service
+
+[Install]
+WantedBy=timers.target
