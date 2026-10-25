@@ -35,16 +35,16 @@ QWEN_TASK_MODEL_ROLES = dict(GENERATION_CONFIG.get("task_model_roles", {}))
 # DashScope Responses API 会在入站阶段按请求体字节数拒绝超大请求；这里用软限制预留
 # JSON、模型名和 extra_body 的余量，避免图片 base64 后把最终 QA 请求撑爆。
 QWEN_RESPONSES_REQUEST_BODY_LIMIT_BYTES = int(
-    GENERATION_CONFIG.get("qwen_responses_request_body_limit_bytes") or 6_291_456
+    GENERATION_CONFIG.get("qwen_responses_request_body_limit_bytes") or 16 * 1024 * 1024
 )
 QWEN_RESPONSES_REQUEST_BODY_SOFT_LIMIT_BYTES = int(
-    GENERATION_CONFIG.get("qwen_responses_request_body_soft_limit_bytes") or 5_500_000
+    GENERATION_CONFIG.get("qwen_responses_request_body_soft_limit_bytes") or 15 * 1024 * 1024
 )
 QWEN_RESPONSES_IMAGE_TARGET_BYTES = int(
     GENERATION_CONFIG.get("qwen_responses_image_target_bytes") or 1_500_000
 )
 QWEN_RESPONSES_MAX_IMAGE_COUNT = int(
-    GENERATION_CONFIG.get("qwen_responses_max_image_count") or 2
+    GENERATION_CONFIG.get("qwen_responses_max_image_count") or 250
 )
 QWEN_RESPONSES_IMAGE_COMPRESSION_STEPS = (
     (1600, 85),

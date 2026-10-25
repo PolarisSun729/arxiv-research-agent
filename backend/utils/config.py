@@ -843,11 +843,12 @@ GENERATION_CONFIG: Dict[str, Any] = {
     # 每次生成的完整上下文与回答落盘到 05-generation-results，仅供调试复盘；
     # 文件含用户问题和回答原文且没有清理机制，默认关闭，排查时再临时打开。
     "save_generation_results": _env_bool("SAVE_GENERATION_RESULTS", False),
-    # Responses API 多模态请求：请求体上限是 base64 图片的传输限制（DashScope 约 6MB），不是上下文限制；
-    # 图片数量按 256K 上下文放开，单图目标字节会按剩余请求体预算自适应压缩。
-    "qwen_responses_max_image_count": _env_int("QWEN_RESPONSES_MAX_IMAGE_COUNT", 30),
-    "qwen_responses_request_body_limit_bytes": _env_int("QWEN_RESPONSES_REQUEST_BODY_LIMIT_BYTES", 6_291_456),
-    "qwen_responses_request_body_soft_limit_bytes": _env_int("QWEN_RESPONSES_REQUEST_BODY_SOFT_LIMIT_BYTES", 5_500_000),
+    # Responses API 多模态请求按百炼官方限制设置（https://help.aliyun.com/zh/model-studio/vision）：
+    # dashscope.aliyuncs.com 域名请求体上限 16 MiB（工作空间域名 64MB），Base64 传图单次最多 250 张；
+    # 软上限预留 1 MiB 给 JSON 包装和文本，单图目标字节会按剩余请求体预算自适应压缩。
+    "qwen_responses_max_image_count": _env_int("QWEN_RESPONSES_MAX_IMAGE_COUNT", 250),
+    "qwen_responses_request_body_limit_bytes": _env_int("QWEN_RESPONSES_REQUEST_BODY_LIMIT_BYTES", 16 * 1024 * 1024),
+    "qwen_responses_request_body_soft_limit_bytes": _env_int("QWEN_RESPONSES_REQUEST_BODY_SOFT_LIMIT_BYTES", 15 * 1024 * 1024),
     "qwen_responses_image_target_bytes": _env_int("QWEN_RESPONSES_IMAGE_TARGET_BYTES", 1_500_000),
     # 任务到模型角色的路由表只保留在配置层，业务代码只负责读取，不再硬编码模型名。
     "task_model_roles": {
