@@ -452,6 +452,11 @@ filetype==1.2.0 \
     # via
     #   -c requirements.lock.txt
     #   docling-slim
+flatbuffers==25.12.19 \
+    --hash=sha256:7634f50c427838bb021c2d66a3d1168e9d199b0607e6329399f04846d42e20b4
+    # via
+    #   -c requirements.lock.txt
+    #   onnxruntime
 fsspec==2026.2.0 \
     --hash=sha256:6544e34b16869f5aacd5b90bdf1a71acb37792ea3ddf6125ee69a22a53fb8bff \
     --hash=sha256:98de475b5cb3bd66bedd5c4679e87b4fdfe1a3bf4d707b151b3c07e58c9a2437
@@ -1195,6 +1200,7 @@ networkx==3.6.1 \
     --hash=sha256:d47fbf302e7d9cbbb9e2555a0d267983d2aa476bac30e90dfbe5669bd57f3762
     # via
     #   -c requirements.lock.txt
+    #   pymupdf-layout
     #   torch
 numpy==2.4.4 \
     --hash=sha256:07077278157d02f65c43b1b26a3886bce886f95d20aabd11f87932750dfb14ed \
@@ -1278,8 +1284,10 @@ numpy==2.4.4 \
     #   docling-slim
     #   faiss-cpu
     #   milvus-lite
+    #   onnxruntime
     #   opencv-python-headless
     #   pandas
+    #   pymupdf-layout
     #   rapidocr
     #   safetensors
     #   scikit-learn
@@ -1300,6 +1308,34 @@ omegaconf==2.3.0 \
     # via
     #   -c requirements.lock.txt
     #   rapidocr
+onnxruntime==1.31.0 \
+    --hash=sha256:09d56445c1753e66e0912de69d3f0184016ad9a191dcd6925bf5dd570d2bfbe5 \
+    --hash=sha256:0ba02a44acb6203040354d9a1f160e3f37a43feac7bb05caa3e0ea545efed505 \
+    --hash=sha256:1ecc1450af28d2cf362990e188ccc81b51388f317f641ad973ab4301473200f2 \
+    --hash=sha256:278e0dc922ec69b05a28f59110d5421e2ec8b1d0dd46c6b10c063069a4051e72 \
+    --hash=sha256:317608967b03807ed4661113b08293fac02a1db6496a6863a07d9f19232936ad \
+    --hash=sha256:35758d7606d578ec5b9d65f6e8a1f488013194c3f6097038a3223cb26d35ef9a \
+    --hash=sha256:37c7dfe398550afdf9670a29315dbb88e49d8afc473ffaf1f410376efbb9c80a \
+    --hash=sha256:37fd78cee5160c7a43a1730ccb3682ffd880af9c9e80385d625c0c2f8b125809 \
+    --hash=sha256:5c54a0eb7b2b4eef3eb9dcfaf82f5ce880db07288dc309574f6657e9da5cc754 \
+    --hash=sha256:5e129d6c56abd53e659cb70f00a108d6824086470ff99c2e47a82e5786563db3 \
+    --hash=sha256:73e0165d58ece068c2a8a1c477c90b38e5a8adbbd399fdfdfd4bd79cbc28ff8d \
+    --hash=sha256:83e3dbcf6abc6189c4bdf7d329c07ba1133c88172134c266d84b4409aa3b9dbf \
+    --hash=sha256:984c0a2c1ad6a41fbc101dc3949abe4a72254892d01a5e70d9b792711e0bfa54 \
+    --hash=sha256:aaab9b3af536b06ca27ab5e35e3d429c97457ce76cf298af103f687e8b9975c0 \
+    --hash=sha256:ad663106f6eeff3d454f24a786450459d07f30e74863851104fc1b8b3f368127 \
+    --hash=sha256:cbf1a7f6470ddfe9dbc781966af8ce4a10e1858d75a93f93cc6b9367c9587870 \
+    --hash=sha256:d25cd65874b75fdf16149120a04d0cd4551f860a3c8e2ecec785a1903e41d8aa \
+    --hash=sha256:d2d5ac22f896c810be2b2b171392bb908f80b6c9a7e2d592ddb7435c928044e1 \
+    --hash=sha256:d4092b78fc5bab77ce6522393098cdb2535423045ecdcff15cc0d022162d6b66 \
+    --hash=sha256:e0e050bf9ec754950a6ba9830e4032f4004d972c6f38c5642fef26d44d894965 \
+    --hash=sha256:e4efa4a1a0bb0b5173c6a3292c181d518b8323f9d56e978635d0c09d38c94d1a \
+    --hash=sha256:e51d10d2e2e1e5bbf9b126a0cd9853d3e6c4e21424518dd50160b91471be33dc \
+    --hash=sha256:e85c1632c0a8cf488bd8f1039f5320877b864c8f9ebd4122fb8bb909f83b7096 \
+    --hash=sha256:e93d7c5fad20afa697ac16f376fd0306ed180f9a376e86106cc0b7d84f53ef87
+    # via
+    #   -c requirements.lock.txt
+    #   pymupdf-layout
 openai==2.36.0 \
     --hash=sha256:139dea0edd2f1b30c33d46ae1a6929e03906254140318e4608e98fe8c566f2e7 \
     --hash=sha256:143f6194b548dbc2c921af1f1b03b9f14c85fed8a75b5b516f5bcc11a2a50c63
@@ -1469,6 +1505,7 @@ packaging==26.2 \
     #   langchain-core
     #   langsmith
     #   limits
+    #   onnxruntime
     #   pytest
     #   safetensors
     #   transformers
@@ -1653,6 +1690,7 @@ protobuf==6.33.6 \
     --hash=sha256:f443a394af5ed23672bc6c486be138628fbe5c651ccbc536873d7da23d1868cf
     # via
     #   -c requirements.lock.txt
+    #   onnxruntime
     #   pymilvus
 psutil==7.2.2 \
     --hash=sha256:0746f5f8d406af344fd547f1c8daa5f5c33dbc293bb8d6a16d80b4bb88f59372 \
@@ -1957,6 +1995,24 @@ pymupdf==1.27.2.3 \
     # via
     #   -c requirements.lock.txt
     #   -r requirements.txt
+    #   pymupdf-layout
+    #   pymupdf4llm
+pymupdf-layout==1.27.2.3 \
+    --hash=sha256:303b9414216dfaf711ec7d807b6f1e4c3e0a92bbb4569340fcedd9d5593d16ca \
+    --hash=sha256:503b64d9b6b31ea3af79ef85cf7d36950c5048af468cb297684d2953553c62ad \
+    --hash=sha256:5656b09669dcd7c51f539afb6fdaf853602bab4cbc20479ee5ee1a85a4e32b60 \
+    --hash=sha256:75c2ab3c0e8830ac2bc50cfd32d375a30768a2610dac72a02f08265336e0834f \
+    --hash=sha256:fcf03aa815cbceebdb3263dd6a190de4547c46b1d168928836ec38738afe127d
+    # via
+    #   -c requirements.lock.txt
+    #   -r requirements.txt
+    #   pymupdf4llm
+pymupdf4llm==1.27.2.3 \
+    --hash=sha256:42ec1a47ddc62be3f4f40c116d27618611c6f9fa366719016d9ddc3f3a3dc22b \
+    --hash=sha256:bd724b79fa3f06a5b28d7a65f7acfa8de56e04bdb603ac2d6dff315e0d151aaa
+    # via
+    #   -c requirements.lock.txt
+    #   -r requirements.txt
 pypdf==6.11.0 \
     --hash=sha256:062b51c81b0910e6d2755e99e1c5547a0a23b7d0a32322af66240d8edcfabe87 \
     --hash=sha256:769394d5756d5b304c9b6bef88b54b1816b328e7e6fc9254e625529a15ed4ab8
@@ -2189,6 +2245,7 @@ pyyaml==6.0.3 \
     #   huggingface-hub
     #   langchain-core
     #   omegaconf
+    #   pymupdf-layout
     #   rapidocr
     #   transformers
 rapidocr==3.10.0 \
@@ -2757,6 +2814,7 @@ tabulate==0.10.0 \
     # via
     #   -c requirements.lock.txt
     #   docling-core
+    #   pymupdf4llm
 tenacity==9.1.4 \
     --hash=sha256:6095a360c919085f28c6527de529e76a06ad89b23659fa881ae0649b867a9d55 \
     --hash=sha256:adb31d4c263f2bd041081ab33b498309a57c77f9acf2db65aadf0898179cf93a
