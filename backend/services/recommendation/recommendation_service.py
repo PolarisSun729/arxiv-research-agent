@@ -683,9 +683,9 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         步骤：
         1. 对全部候选查询 evidence 缓存并挂载（缓存命中 / 失败缓存 / 自带 concepts 分别计数）；
         2. 对 top K 中仍缺 concepts 的候选发起抽取，受 max_llm_calls 预算限制：
-           - 默认在请求内同步调用 LLM，本次请求即可用上新 concepts；
-           - allow_sync_generation=False（搜索重排）或开启 lazy / async 时，提交到后台线程执行，
+           - allow_sync_generation=False（搜索重排）或开启 lazy / async（默认开启）时，提交到后台线程执行，
              本次请求按缺失处理（退回低置信度文本兜底），结果写入缓存后下次请求命中；
+           - lazy / async 都关闭时在请求内同步调用 LLM，本次请求即可用上新 concepts；
         3. 抽取结果（包括失败卡）写回持久化缓存，避免同一论文反复失败重试；
         4. 为全部候选写入 concepts 来源调试信息。
 
