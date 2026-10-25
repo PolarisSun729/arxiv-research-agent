@@ -18,11 +18,11 @@ requests>=2.32,<3
 tenacity>=9.1,<10
 feedparser>=6.0,<7
 pypdf>=6.11,<7
-PyMuPDF>=1.27,<2
-# 快速问答的 PDF 解析；pymupdf4llm / pymupdf-layout 与 PyMuPDF 同版本号发布，必须一起锁定。
+PyMuPDF>=2.0,<3
+# 快速问答的 PDF 解析；pymupdf4llm / pymupdf-layout 与 PyMuPDF 同版本号发布，三者一起升级。
 # pymupdf-layout 为 PolyForm Noncommercial 许可，项目不商用；商用前需替换。
-pymupdf4llm==1.27.2.3
-pymupdf-layout==1.27.2.3
+pymupdf4llm>=2.0,<3
+pymupdf-layout>=2.0,<3
 docling>=2.138,<3
 pymilvus>=2.6,<3
 milvus-lite>=3.2,<4

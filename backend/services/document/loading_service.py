@@ -12,7 +12,7 @@ import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-import fitz  # PyMuPDF
+import pymupdf
 
 from services.document.isolated_subprocess import run_in_isolated_subprocess
 from utils.config import DOCLING_CONFIG
@@ -644,7 +644,7 @@ class LoadingService:
         output_path = os.path.join(export_dir, "annotated_layout.pdf")
 
         try:
-            source_pdf = fitz.open(source_path)
+            source_pdf = pymupdf.open(source_path)
         except Exception as exc:
             logger.warning("Failed to open source PDF for Docling annotation export: %s", exc)
             return {
@@ -655,7 +655,7 @@ class LoadingService:
 
         annotated_pdf = None
         try:
-            annotated_pdf = fitz.open()
+            annotated_pdf = pymupdf.open()
             page_count = len(source_pdf)
             annotated_pdf.insert_pdf(source_pdf)
 
@@ -847,12 +847,12 @@ class LoadingService:
             top = max(margin, margin)
             right = min(float(page_rect.width) - margin, left + legend_width)
             bottom = min(float(page_rect.height) - margin, top + legend_height)
-            legend_rect = fitz.Rect(left, top, right, bottom)
+            legend_rect = pymupdf.Rect(left, top, right, bottom)
 
             page.draw_rect(legend_rect, color=(0.72, 0.72, 0.72), fill=(1, 1, 1), width=0.8, overlay=True)
             self._insert_docling_legend_text(
                 page,
-                fitz.Point(legend_rect.x0 + legend_padding, legend_rect.y0 + 10),
+                pymupdf.Point(legend_rect.x0 + legend_padding, legend_rect.y0 + 10),
                 "图例 / Legend",
                 fontsize=8,
                 color=(0.1, 0.1, 0.1),
@@ -860,11 +860,11 @@ class LoadingService:
 
             y = legend_rect.y0 + legend_padding + legend_title_height + 1
             for label, color in deduped_entries:
-                swatch = fitz.Rect(legend_rect.x0 + legend_padding, y + 2, legend_rect.x0 + legend_padding + 8, y + 10)
+                swatch = pymupdf.Rect(legend_rect.x0 + legend_padding, y + 2, legend_rect.x0 + legend_padding + 8, y + 10)
                 page.draw_rect(swatch, color=color, fill=color, width=0.8, overlay=True)
                 self._insert_docling_legend_text(
                     page,
-                    fitz.Point(swatch.x1 + 6, y + 9),
+                    pymupdf.Point(swatch.x1 + 6, y + 9),
                     label,
                     fontsize=7,
                     color=(0.12, 0.12, 0.12),
@@ -876,7 +876,7 @@ class LoadingService:
     def _insert_docling_legend_text(
         self,
         page: Any,
-        point: "fitz.Point",
+        point: "pymupdf.Point",
         text: str,
         fontsize: float,
         color: tuple[float, float, float],
@@ -893,8 +893,8 @@ class LoadingService:
         for segment, fontname in ((cjk_part, "china-s"), (separator + latin_part, "helv")):
             if not segment:
                 continue
-            page.insert_text(fitz.Point(x, point.y), segment, fontsize=fontsize, fontname=fontname, color=color, overlay=True)
-            x += fitz.get_text_length(segment, fontname=fontname, fontsize=fontsize)
+            page.insert_text(pymupdf.Point(x, point.y), segment, fontsize=fontsize, fontname=fontname, color=color, overlay=True)
+            x += pymupdf.get_text_length(segment, fontname=fontname, fontsize=fontsize)
 
     def _collect_docling_bbox_candidates(self, item: Dict[str, Any]) -> List[Dict[str, Any]]:
         """从标准化条目中提取可用于标注的 bbox 候选框。
@@ -1514,7 +1514,7 @@ class LoadingService:
             return {}
 
         try:
-            import fitz  # PyMuPDF
+            import pymupdf
         except Exception as exc:
             logger.warning(
                 "PyMuPDF is unavailable for docling picture bbox fallback on %s (picture #%s): %s",
@@ -1525,7 +1525,7 @@ class LoadingService:
             return {}
 
         try:
-            pdf_doc = fitz.open(source_path)
+            pdf_doc = pymupdf.open(source_path)
         except Exception as exc:
             logger.warning(
                 "Failed to open PDF for docling picture bbox fallback on %s (picture #%s): %s",
@@ -1803,7 +1803,7 @@ class LoadingService:
             bbox = item.get("bbox")
         return {"page_no": page_no, "bbox": self._normalize_bbox(bbox)}
 
-    def _normalize_docling_bbox_for_pymupdf(self, bbox: Any, page_height: float, coord_origin: Optional[str] = None) -> Optional["fitz.Rect"]:
+    def _normalize_docling_bbox_for_pymupdf(self, bbox: Any, page_height: float, coord_origin: Optional[str] = None) -> Optional["pymupdf.Rect"]:
         explicit_coord_origin = str(coord_origin or "").upper()
         detected_coord_origin = explicit_coord_origin
         if isinstance(bbox, dict):
@@ -1842,8 +1842,8 @@ class LoadingService:
         y0 = min(top, bottom)
         y1 = max(top, bottom)
         try:
-            import fitz  # PyMuPDF
-            return fitz.Rect(left, y0, right, y1)
+            import pymupdf
+            return pymupdf.Rect(left, y0, right, y1)
         except Exception:
             return None
 
