@@ -255,6 +255,70 @@ def _split_display_values(value: Any) -> List[str]:
     return [part for part in parts if part]
 
 
+def build_paper_payload(entity: Any, score: Optional[float], distance: Optional[float]) -> Dict[str, Any]:
+    """把论文级实体转换为论文卡片结构；摘要缺失时用 content 兜底，作者/分类拆成列表。"""
+    if entity is None:
+        return {
+            "arxiv_id": "",
+            "title": "",
+            "authors": [],
+            "abstract": "",
+            "categories": [],
+            "published_date": "",
+            "url": "",
+            "similarity_score": score,
+            "score": score,
+            "distance": distance,
+            "metadata": {},
+        }
+
+    getter = _entity_getter(entity)
+
+    authors_raw = getter("authors", "") or ""
+    categories_raw = getter("categories", "") or ""
+    abstract = getter("abstract", "") or getter("content", "") or ""
+    published_date = getter("published_date", "") or ""
+
+    payload = {
+        "arxiv_id": str(getter("arxiv_id", "") or ""),
+        "title": str(getter("title", "") or ""),
+        "authors": _split_display_values(authors_raw),
+        "abstract": str(abstract),
+        "categories": _split_display_values(categories_raw),
+        "published_date": str(published_date),
+        "url": str(getter("url", "") or ""),
+        "similarity_score": score,
+        "score": score,
+        "distance": distance,
+        "metadata": {
+            "embedding_model": str(getter("embedding_model", "") or ""),
+        },
+    }
+    return payload
+
+
+def build_paper_embedding_payload(entity: Any) -> Dict[str, Any]:
+    """把论文向量实体转换为可复用的 embedding 记录（含原始向量）。"""
+    getter = _entity_getter(entity)
+
+    vector_value = getter("vector", []) or []
+    # 部分 pymilvus 版本会把向量包成二维 [[...]]，这里取第一行还原为一维向量。
+    if vector_value and isinstance(vector_value[0], (list, tuple)):
+        vector_value = vector_value[0]
+
+    return {
+        "embedding_id": int(getter("id", 0) or 0),
+        "arxiv_id": str(getter("arxiv_id", "") or ""),
+        "title": str(getter("title", "") or ""),
+        "authors": getter("authors", []) or [],
+        "categories": getter("categories", []) or [],
+        "published_date": str(getter("published_date", "") or ""),
+        "url": str(getter("url", "") or ""),
+        "embedding_model": str(getter("embedding_model", "") or ""),
+        "vector": [float(value) for value in vector_value] if vector_value else [],
+    }
+
+
 def _build_arxiv_id_exclude_filter(filter_arxiv_ids: Optional[List[str]], field_names: Set[str]) -> str:
     """生成排除指定 arxiv_id 的 Milvus 过滤表达式；collection 没有 arxiv_id 字段或列表为空时返回空串。"""
     if not filter_arxiv_ids or "arxiv_id" not in field_names:
@@ -1404,63 +1468,7 @@ class VectorStoreService:
         return payload
 
     def _build_paper_payload(self, entity: Any, score: Optional[float], distance: Optional[float]) -> Dict[str, Any]:
-        """把论文级实体转换为论文卡片结构；摘要缺失时用 content 兜底，作者/分类拆成列表。"""
-        if entity is None:
-            return {
-                "arxiv_id": "",
-                "title": "",
-                "authors": [],
-                "abstract": "",
-                "categories": [],
-                "published_date": "",
-                "url": "",
-                "similarity_score": score,
-                "score": score,
-                "distance": distance,
-                "metadata": {},
-            }
-
-        getter = _entity_getter(entity)
-
-        authors_raw = getter("authors", "") or ""
-        categories_raw = getter("categories", "") or ""
-        abstract = getter("abstract", "") or getter("content", "") or ""
-        published_date = getter("published_date", "") or ""
-
-        payload = {
-            "arxiv_id": str(getter("arxiv_id", "") or ""),
-            "title": str(getter("title", "") or ""),
-            "authors": _split_display_values(authors_raw),
-            "abstract": str(abstract),
-            "categories": _split_display_values(categories_raw),
-            "published_date": str(published_date),
-            "url": str(getter("url", "") or ""),
-            "similarity_score": score,
-            "score": score,
-            "distance": distance,
-            "metadata": {
-                "embedding_model": str(getter("embedding_model", "") or ""),
-            },
-        }
-        return payload
+        return build_paper_payload(entity, score, distance)
 
     def _build_paper_embedding_payload(self, entity: Any) -> Dict[str, Any]:
-        """把论文向量实体转换为可复用的 embedding 记录（含原始向量）。"""
-        getter = _entity_getter(entity)
-
-        vector_value = getter("vector", []) or []
-        # 部分 pymilvus 版本会把向量包成二维 [[...]]，这里取第一行还原为一维向量。
-        if vector_value and isinstance(vector_value[0], (list, tuple)):
-            vector_value = vector_value[0]
-
-        return {
-            "embedding_id": int(getter("id", 0) or 0),
-            "arxiv_id": str(getter("arxiv_id", "") or ""),
-            "title": str(getter("title", "") or ""),
-            "authors": getter("authors", []) or [],
-            "categories": getter("categories", []) or [],
-            "published_date": str(getter("published_date", "") or ""),
-            "url": str(getter("url", "") or ""),
-            "embedding_model": str(getter("embedding_model", "") or ""),
-            "vector": [float(value) for value in vector_value] if vector_value else [],
-        }
+        return build_paper_embedding_payload(entity)

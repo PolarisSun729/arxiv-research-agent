@@ -484,6 +484,22 @@ PY
 
 失败的解压目录、未完成 venv 和旧版本会保留以便排障；成功后会删除本次上传归档和 release 内已安装的 wheel 副本。当前没有自动清理历史 venv 的机制，需定期检查磁盘。清理前核对 `current`、`previous` 以及它们的 `.venv` 真实目标，只删除不再被引用的旧代码/环境；不要删除 `shared`，也不要用 `git clean` 清理生产根目录。
 
+### 论文向量改用文件存储
+
+论文级向量（`arxiv_paper_embeddings`，推荐与向量维护用）默认仍在 Milvus Lite，整份常驻 Web 进程内存。设置 `PAPER_VECTOR_BACKEND=file` 后改存 `06-database/paper_vectors.f32`（向量）和 `paper_vectors.db`（SQLite 元数据），检索时按需读文件，删除不需要合并。论文问答的分块向量不受影响，仍在 Milvus Lite。
+
+切换前先把已有向量导出，不重新调用 embedding。Milvus Lite 只允许一个进程打开，导出用数据目录的副本，不用停服务；脚本会关掉副本上的后台合并，峰值约 2GB，并把自己设为优先被 OOM 杀掉的进程：
+
+```bash
+cd /opt/arxiv-research-agent/current/backend
+sudo -u arxiv cp -a 06-database/milvus_lite.db /tmp/milvus_export.db
+sudo -u arxiv rm -f /tmp/milvus_export.db/LOCK
+sudo -u arxiv ../.venv/bin/python 07-arxiv-tools/export_paper_vectors.py --milvus-db /tmp/milvus_export.db
+sudo -u arxiv rm -rf /tmp/milvus_export.db
+```
+
+退出码 0 表示导出完成且读回、ID 集合、抽样检索三项校验都通过；2 表示校验不通过，`.tmp` 文件保留供排查；目标文件已存在时直接退出，不覆盖。随后在 `.env.production` 加 `PAPER_VECTOR_BACKEND=file` 并重启服务；拷贝副本之后新写入 Milvus 的论文由向量维护任务下一轮补上。回退只需删掉这一行再重启，期间新增的论文由维护任务补回 Milvus；确认稳定前不要删除 Milvus 里的旧数据。
+
 ## 本地验证范围
 
 ```bash

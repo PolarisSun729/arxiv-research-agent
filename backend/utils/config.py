@@ -171,6 +171,20 @@ MILVUS_CONFIG: Dict[str, Any] = {
     "lite_max_segment_rows": _env_int("MILVUS_LITE_MAX_SEGMENT_ROWS", 8000),
 }
 
+# 论文级向量（arxiv_paper_embeddings）的存储后端：milvus 沿用 Milvus Lite；
+# file 存成内存映射的向量文件 + SQLite 元数据，向量不再常驻 Web 进程内存（论文问答的分块向量不受影响）。
+PAPER_VECTOR_CONFIG: Dict[str, Any] = {
+    "backend": _env_str("PAPER_VECTOR_BACKEND", "milvus").lower(),
+    "vectors_path": resolve_storage_path(
+        _env_str("PAPER_VECTOR_FILE_PATH"),
+        default_path=BACKEND_DATA_ROOT / "paper_vectors.f32",
+    ),
+    "db_path": resolve_storage_path(
+        _env_str("PAPER_VECTOR_DB_PATH"),
+        default_path=BACKEND_DATA_ROOT / "paper_vectors.db",
+    ),
+}
+
 SQLITE_CONFIG: Dict[str, Any] = {
     # 持久化路径在配置加载时固定解析，避免启动目录不同导致状态库分裂。
     "database_path": resolve_storage_path(
