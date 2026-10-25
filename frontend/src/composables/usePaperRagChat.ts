@@ -314,8 +314,11 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
 
     sessionLoading.value = true
     try {
-      await refreshSessions()
-      const response = await getRecentPaperChatSession(currentPaperId, getUserId())
+      // 会话列表和最近会话互不依赖，并发请求省一个网络往返。
+      const [, response] = await Promise.all([
+        refreshSessions(),
+        getRecentPaperChatSession(currentPaperId, getUserId())
+      ])
       const recentSession = response.item
       currentSession.value = recentSession
       if (recentSession?.session_id) {

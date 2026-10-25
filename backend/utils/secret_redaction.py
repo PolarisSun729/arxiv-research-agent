@@ -189,16 +189,26 @@ def _configured_secret_variants() -> tuple[str, ...]:
     return tuple(sorted(variants, key=len, reverse=True))
 
 
-def redact_text(value: str) -> str:
+def redact_text(value: str, *, _secret_variants: tuple[str, ...] | None = None) -> str:
     """先按真实配置值脱敏，再处理未知凭据；截断必须在脱敏之后执行。"""
-    for secret in _configured_secret_variants():
+    secret_variants = _configured_secret_variants() if _secret_variants is None else _secret_variants
+    for secret in secret_variants:
         value = value.replace(secret, REDACTED)
     assignments = _AssignmentRedactor()
     return _redact_bare_credentials(assignments.feed(value) + assignments.finish())
 
 
-def redact_sensitive_value(value: Any, *, _parent_field: str | None = None) -> Any:
+def redact_sensitive_value(
+    value: Any,
+    *,
+    _parent_field: str | None = None,
+    _secret_variants: tuple[str, ...] | None = None,
+) -> Any:
     """保留业务数据结构与数值，仅移除凭据字段和文本中的密钥。"""
+    if _secret_variants is None:
+        # 收集密钥变体要遍历整个环境变量；每次调用只收集一次再传给递归，
+        # 否则字符串很多的响应（如研究画像）会为每个字符串重复遍历，单次响应耗时可达秒级。
+        _secret_variants = _configured_secret_variants()
     if isinstance(value, Mapping):
         # BM25 的 token 表示匹配词；仅在已知匹配词结构内豁免字段名，值本身仍按密钥规则处理。
         is_matched_term = (
@@ -206,19 +216,22 @@ def redact_sensitive_value(value: Any, *, _parent_field: str | None = None) -> A
             and {"idf", "term_score", "fields", "query_sources"}.issubset(value)
         )
         return {
-            redact_text(str(key)): (
+            redact_text(str(key), _secret_variants=_secret_variants): (
                 REDACTED if is_secret_field(key) and not (is_matched_term and key == "token")
-                else redact_sensitive_value(item, _parent_field=str(key))
+                else redact_sensitive_value(item, _parent_field=str(key), _secret_variants=_secret_variants)
             )
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple)):
-        return [redact_sensitive_value(item, _parent_field=_parent_field) for item in value]
+        return [
+            redact_sensitive_value(item, _parent_field=_parent_field, _secret_variants=_secret_variants)
+            for item in value
+        ]
     if isinstance(value, str):
-        return redact_text(value)
+        return redact_text(value, _secret_variants=_secret_variants)
     if value is None or isinstance(value, (int, float, bool)):
         return value
-    return redact_text(str(value))
+    return redact_text(str(value), _secret_variants=_secret_variants)
 
 
 class _RedactedLogRecord(logging.LogRecord):

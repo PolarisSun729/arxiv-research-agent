@@ -27,11 +27,13 @@ from services.paper_qa.build_cache import (
     LLM_RETRIEVAL_QUESTIONS_PROMPT_VERSION,
     LLM_RETRIEVAL_SUMMARY_PROMPT_VERSION,
 )
-from utils.config import get_enhanced_retrieval_runtime_config
+from utils.config import GENERATION_CONFIG, get_enhanced_retrieval_runtime_config
 
 logger = logging.getLogger(__name__)
 
 ENHANCED_RETRIEVAL_CONFIG = get_enhanced_retrieval_runtime_config()
+# 生成式 summary/question 属于建库期调用，用较短超时，避免单个卡住的请求拖住整篇建库。
+INDEX_GENERATION_TIMEOUT_SECONDS = GENERATION_CONFIG["qwen_index_build_timeout_seconds"]
 
 # BM25 各字段的权重：章节/标题加权，图表 caption 与 OCR 辅助文本大幅降权以压制噪声。
 KEYWORD_FIELD_WEIGHTS = {
@@ -538,7 +540,12 @@ class RetrievalIndexBuilder:
             return ""
         prompt = self._summary_prompt(paper_chunk, metadata)
         # 复用现有生成服务时只接受严格 JSON，防止自由文本被误当成可追踪的 index_text。
-        response = completer(prompt, task_type="retrieval_index_generation", enable_thinking=False)
+        response = completer(
+            prompt,
+            task_type="retrieval_index_generation",
+            enable_thinking=False,
+            timeout=INDEX_GENERATION_TIMEOUT_SECONDS,
+        )
         parsed = self._parse_generated_payload(response)
         return self._normalize_generated_text(parsed.get("summary", ""))
 
@@ -558,7 +565,12 @@ class RetrievalIndexBuilder:
             return []
         prompt = self._question_prompt(paper_chunk, metadata)
         # question index 直接进入召回入口，因此解析失败必须显式降级而不是吞掉格式问题。
-        response = completer(prompt, task_type="retrieval_index_generation", enable_thinking=False)
+        response = completer(
+            prompt,
+            task_type="retrieval_index_generation",
+            enable_thinking=False,
+            timeout=INDEX_GENERATION_TIMEOUT_SECONDS,
+        )
         parsed = self._parse_generated_payload(response)
         return self._normalize_generated_questions(parsed.get("questions", []))
 

@@ -176,6 +176,10 @@ export const usePaperStore = defineStore('paper', () => {
       // 详情接口不带用户偏好，这里同时取偏好表，让详情页的感兴趣/不感兴趣与列表卡片显示一致。
       const [paper, preferences] = await Promise.all([getPaperById(id), getUserPreferences().catch(() => null)])
       currentPaper.value = paper
+      if (preferences) {
+        // 偏好接口已带当前研究画像，详情页据此读取回答偏好，不再单独请求画像接口。
+        researchProfile.value = preferences.research_profile || researchProfile.value
+      }
       if (currentPaper.value) {
         if (preferences) {
           applyPreferenceLabels([currentPaper.value], preferences.liked_papers || [], preferences.disliked_papers || [])
