@@ -42,6 +42,7 @@ if TYPE_CHECKING:
         ResearchProfileStore,
         UserPreferenceStore,
     )
+    from services.storage.paper_vector_store import FilePaperVectorStore
     from services.storage.vector_store_service import VectorStoreService
 
 DATA_SOURCE = CORE_CONFIG["arxiv_data_source"]
@@ -156,6 +157,21 @@ def get_vector_store_service() -> VectorStoreService:
     from services.storage.vector_store_service import VectorStoreService
 
     return VectorStoreService()
+
+
+@lru_cache(maxsize=1)
+def get_paper_vector_store() -> VectorStoreService | FilePaperVectorStore:
+    """论文级向量（arxiv_paper_embeddings）的存储；PAPER_VECTOR_BACKEND=file 时换成文件存储，两者方法同名同参。"""
+    from utils.config import PAPER_VECTOR_CONFIG
+
+    backend = PAPER_VECTOR_CONFIG["backend"]
+    if backend == "milvus":
+        return get_vector_store_service()
+    if backend == "file":
+        from services.storage.paper_vector_store import FilePaperVectorStore
+
+        return FilePaperVectorStore(vectors_path=PAPER_VECTOR_CONFIG["vectors_path"], db_path=PAPER_VECTOR_CONFIG["db_path"])
+    raise ValueError(f"Unsupported PAPER_VECTOR_BACKEND: {backend!r} (expected 'milvus' or 'file')")
 
 
 @lru_cache(maxsize=1)
@@ -278,7 +294,7 @@ def get_index_job_manager() -> IndexJobManager:
 
 @lru_cache(maxsize=1)
 def get_oai_embedding_maintainer() -> OaiEmbeddingMaintainer:
-    """论文向量维护任务；和推荐共用 embedding / 向量库单例，Milvus Lite 在本进程只打开一次。"""
+    """论文向量维护任务；和推荐共用 embedding / 论文向量存储单例，向量库在本进程只打开一次。"""
     from services.arxiv.arxiv_oai_service import create_oai_embedding_handler, prune_out_of_window_embeddings
     from services.arxiv.oai_embedding_maintainer import OaiEmbeddingMaintainer
     from utils.config import ARXIV_OAI_CONFIG
@@ -287,7 +303,7 @@ def get_oai_embedding_maintainer() -> OaiEmbeddingMaintainer:
     return OaiEmbeddingMaintainer(
         handler_factory=lambda: create_oai_embedding_handler(
             embedding_service=get_embedding_service(),
-            vector_store_service=get_vector_store_service(),
+            vector_store_service=get_paper_vector_store(),
         ),
         database_service_factory=get_oai_database_service,
         prune_out_of_window=prune_out_of_window_embeddings,
@@ -366,7 +382,8 @@ def get_recommendation_service() -> RecommendationService:
         profile_event_store=get_profile_event_store(),
         memory_service=get_memory_service(),
         embedding_service=get_embedding_service(),
-        vector_store_service=get_vector_store_service(),
+        # 推荐只读写论文级向量（召回、画像、候选物化），不碰论文问答的分块向量。
+        vector_store_service=get_paper_vector_store(),
         get_embedding_config=get_current_embedding_config,
         get_clustering_config=get_current_recommendation_clustering_config,
         arxiv_service_factory=lambda: get_arxiv_search_backend(),
@@ -449,6 +466,7 @@ def iter_service_getters() -> list[tuple[str, Callable[[], Any]]]:
         ("oai_database_service", get_oai_database_service),
         ("embedding_service", get_embedding_service),
         ("vector_store_service", get_vector_store_service),
+        ("paper_vector_store", get_paper_vector_store),
         ("generation_service", get_generation_service),
         ("memory_service", get_memory_service),
         ("enhanced_retrieval_service", get_enhanced_retrieval_service),
