@@ -737,7 +737,7 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
             },
         ]
 
-        with mock.patch.dict(self.service.RECOMMENDATION_CONFIG["candidate_concept_enrichment"], {"top_k": 1}, clear=False), \
+        with mock.patch.dict(self.service.RECOMMENDATION_CONFIG["candidate_concept_enrichment"], {"top_k": 1, "allow_lazy_generation": False}, clear=False), \
              mock.patch.object(self.service, "_build_profile_signal_bundle", return_value={"profile": {"positive_topics": ["RAG retrieval optimization"], "canonical_topics": [{"label": "RAG retrieval optimization", "aliases": []}]}, "actions": {}, "excluded_ids": [], "disabled": False}), \
              mock.patch.object(self.service, "_get_or_refresh_interest_vector", return_value={"vector_data": [1.0, 0.0, 0.0], "interest_clusters": [], "disliked_vector_data": None, "negative_feedback_profile": {}, "profile_mode": "mean", "cluster_count": 0}), \
              mock.patch.object(self.service, "_fetch_recent_db_candidates", return_value=list(candidate_pool)), \
@@ -787,7 +787,7 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
             }
         ]
 
-        with mock.patch.dict(failing_service.RECOMMENDATION_CONFIG["candidate_concept_enrichment"], {"top_k": 1}, clear=False), \
+        with mock.patch.dict(failing_service.RECOMMENDATION_CONFIG["candidate_concept_enrichment"], {"top_k": 1, "allow_lazy_generation": False}, clear=False), \
              mock.patch.object(failing_service, "_build_profile_signal_bundle", return_value={"profile": {"positive_topics": ["question answering"], "canonical_topics": [{"label": "question answering", "aliases": []}]}, "actions": {}, "excluded_ids": [], "disabled": False}), \
              mock.patch.object(failing_service, "_get_or_refresh_interest_vector", return_value={"vector_data": [1.0, 0.0, 0.0], "interest_clusters": [], "disliked_vector_data": None, "negative_feedback_profile": {}, "profile_mode": "mean", "cluster_count": 0}), \
              mock.patch.object(failing_service, "_fetch_recent_db_candidates", return_value=list(candidate_pool)), \
@@ -854,7 +854,7 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
             },
         ]
 
-        with mock.patch.dict(self.service.RECOMMENDATION_CONFIG["candidate_concept_enrichment"], {"top_k": 2, "max_llm_calls": 1}, clear=False), \
+        with mock.patch.dict(self.service.RECOMMENDATION_CONFIG["candidate_concept_enrichment"], {"top_k": 2, "max_llm_calls": 1, "allow_lazy_generation": False}, clear=False), \
              mock.patch.object(self.service, "_build_profile_signal_bundle", return_value={"profile": {"positive_topics": ["RAG retrieval optimization"], "canonical_topics": [{"label": "RAG retrieval optimization", "aliases": []}]}, "actions": {}, "excluded_ids": [], "disabled": False}), \
              mock.patch.object(self.service, "_get_or_refresh_interest_vector", return_value={"vector_data": [1.0, 0.0, 0.0], "interest_clusters": [], "disliked_vector_data": None, "negative_feedback_profile": {}, "profile_mode": "mean", "cluster_count": 0}), \
              mock.patch.object(self.service, "_fetch_recent_db_candidates", return_value=list(candidate_pool)), \
@@ -909,7 +909,7 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
             }
         ]
 
-        with mock.patch.dict(negative_service.RECOMMENDATION_CONFIG["candidate_concept_enrichment"], {"top_k": 1}, clear=False), \
+        with mock.patch.dict(negative_service.RECOMMENDATION_CONFIG["candidate_concept_enrichment"], {"top_k": 1, "allow_lazy_generation": False}, clear=False), \
              mock.patch.object(negative_service, "_build_profile_signal_bundle", return_value={"profile": {"negative_topics": ["vision-only generation"], "canonical_negative_topics": [{"label": "vision-only generation", "aliases": []}]}, "actions": {}, "excluded_ids": [], "disabled": False}), \
              mock.patch.object(negative_service, "_get_or_refresh_interest_vector", return_value={"vector_data": [1.0, 0.0, 0.0], "interest_clusters": [], "disliked_vector_data": None, "negative_feedback_profile": {}, "profile_mode": "mean", "cluster_count": 0}), \
              mock.patch.object(negative_service, "_fetch_recent_db_candidates", return_value=list(candidate_pool)), \

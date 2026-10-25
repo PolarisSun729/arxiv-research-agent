@@ -478,8 +478,9 @@ RECOMMENDATION_CONFIG: Dict[str, Any] = {
         # 单次请求最多发起（同步执行或提交后台）的概念抽取次数。
         "max_llm_calls": _env_int("RECOMMENDATION_CANDIDATE_CONCEPT_ENRICHMENT_MAX_LLM_CALLS", 5),
         # 打开后主链路只复用缓存，缺失的概念抽取提交到后台线程执行并写回缓存，下次请求即可命中。
+        # 默认打开：同步抽取每篇约 18 秒，5 篇会让推荐请求超过 gunicorn 超时、worker 被杀。
         # 搜索重排链路无论该开关如何都走后台抽取，不在请求里同步等待 LLM。
-        "allow_lazy_generation": _env_bool("RECOMMENDATION_CANDIDATE_CONCEPT_ENRICHMENT_ALLOW_LAZY_GENERATION", False),
+        "allow_lazy_generation": _env_bool("RECOMMENDATION_CANDIDATE_CONCEPT_ENRICHMENT_ALLOW_LAZY_GENERATION", True),
         # 与 allow_lazy_generation 等价（任一开启即走后台抽取），保留以兼容旧配置。
         "allow_async_generation": _env_bool("RECOMMENDATION_CANDIDATE_CONCEPT_ENRICHMENT_ALLOW_ASYNC_GENERATION", False),
         "cache_version": _env_str(
