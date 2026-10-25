@@ -832,6 +832,9 @@ GENERATION_CONFIG: Dict[str, Any] = {
     # rerank 前的 chunk 压缩/摘要使用独立的生成模型配置。
     "qwen_rerank_compress_model_name": _env_str("QWEN_RERANK_COMPRESS_MODEL_NAME", "qwen3.6-plus"),
     "qwen_rerank_compress_enable_thinking": _env_bool("QWEN_RERANK_COMPRESS_ENABLE_THINKING", False),
+    # 建库期（rerank 压缩、检索索引 summary/question）单次 LLM 请求的超时秒数；正常 3~5 秒返回，
+    # 不设时 SDK 默认等 600 秒，一个卡住的请求会拖住整篇建库。超时后由 SDK 自动重试（默认 2 次）。
+    "qwen_index_build_timeout_seconds": float(_env_str("QWEN_INDEX_BUILD_TIMEOUT_SECONDS", "60")),
     "openai_chat_temperature": float(_env_str("OPENAI_CHAT_TEMPERATURE", "0.7")),
     "openai_chat_max_tokens": _env_int("OPENAI_CHAT_MAX_TOKENS", 512),
     "rewrite_query_max_queries_default": _env_int("REWRITE_QUERY_MAX_QUERIES_DEFAULT", 3),

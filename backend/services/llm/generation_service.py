@@ -27,6 +27,7 @@ QWEN_SMALL_MODEL_NAME = GENERATION_CONFIG["small_qwen_model_name"]
 QWEN_LARGE_MODEL_NAME = GENERATION_CONFIG["large_qwen_model_name"]
 QWEN_RERANK_COMPRESS_MODEL_NAME = GENERATION_CONFIG["qwen_rerank_compress_model_name"]
 QWEN_RERANK_COMPRESS_ENABLE_THINKING = GENERATION_CONFIG["qwen_rerank_compress_enable_thinking"]
+QWEN_INDEX_BUILD_TIMEOUT_SECONDS = GENERATION_CONFIG["qwen_index_build_timeout_seconds"]
 REWRITE_QUERY_MAX_QUERIES_DEFAULT = GENERATION_CONFIG["rewrite_query_max_queries_default"]
 QUERY_REWRITE_TEMPERATURE = GENERATION_CONFIG["query_rewrite_temperature"]
 QWEN_TASK_MODEL_ROLES = dict(GENERATION_CONFIG.get("task_model_roles", {}))
@@ -184,6 +185,7 @@ class GenerationService:
                 api_key=api_key,
                 model_name=model_name,
                 enable_thinking=False,
+                timeout=QWEN_INDEX_BUILD_TIMEOUT_SECONDS,
             )
             compressed = self._normalize_rerank_chunk_text(compressed)
             if compressed:
@@ -395,10 +397,11 @@ class GenerationService:
         image_inputs: Optional[List[Dict[str, Any]]] = None,
         request_debug: Optional[Dict[str, Any]] = None,
         temperature: Optional[float] = None,
+        timeout: Optional[float] = None,
     ) -> str:
         """单轮补全；传入 image_inputs 时把图片作为多模态输入附在 prompt 之后，prompt 原样保留不加问答模板。
 
-        temperature 为空时使用模型服务端默认值。
+        temperature 为空时使用模型服务端默认值；timeout 为空时沿用 SDK 默认超时（600 秒）。
         """
         try:
             if not api_key:
@@ -413,9 +416,12 @@ class GenerationService:
             )
             model_name = model_selection["selected_model"]
 
+            # OpenAI SDK 里 timeout=None 表示不限时，所以未指定时不传，保留 SDK 默认值。
+            client_options = {"timeout": timeout} if timeout else {}
             client = OpenAI(
                 api_key=api_key,
                 base_url=QWEN_BASE_URL,
+                **client_options,
             )
             qwen_input: Any = prompt
             if image_inputs:
