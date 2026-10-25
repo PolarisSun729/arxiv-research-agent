@@ -50,6 +50,9 @@ const qaJobPolling = ref(false)
 const qaJobPollFailures = ref(0)
 const qaStatus = ref<QaStatusResult | null>(null)
 const qaDiagnostic = ref<QaDiagnosticResult | null>(null)
+// 诊断要列 Milvus 集合并抽样 chunk，冷启动时要几秒；只在管理员展开诊断面板时才请求。
+const qaDiagnosticOpen = ref(false)
+const qaDiagnosticLoading = ref(false)
 const traceDownloading = ref(false)
 const isNarrowScreen = ref(false)
 const highlightedEvidenceSourceId = ref<string | null>(null)
@@ -253,22 +256,37 @@ async function handleToggleLabel(label: 'liked' | 'disliked') {
   }
 }
 
-async function fetchQaStatus() {
+async function fetchQaDiagnostic() {
+  if (!isAdmin.value || !paperId.value) return
+  qaDiagnosticLoading.value = true
   try {
-    const [statusResult, diagnosticResult] = await Promise.all([
-      getPaperQaStatus(paperId.value),
-      isAdmin.value ? getPaperQaDiagnostic(paperId.value).catch(error => {
-        console.error('Failed to fetch QA diagnostic:', error)
-        return null
-      }) : Promise.resolve(null)
-    ])
-    qaStatus.value = statusResult
-    qaDiagnostic.value = diagnosticResult
+    qaDiagnostic.value = await getPaperQaDiagnostic(paperId.value)
+  } catch (error) {
+    console.error('Failed to fetch QA diagnostic:', error)
+    qaDiagnostic.value = null
+  } finally {
+    qaDiagnosticLoading.value = false
+  }
+}
+
+function handleDiagnosticToggle(event: Event) {
+  qaDiagnosticOpen.value = (event.target as HTMLDetailsElement).open
+  if (qaDiagnosticOpen.value && !qaDiagnostic.value && !qaDiagnosticLoading.value) {
+    fetchQaDiagnostic()
+  }
+}
+
+async function fetchQaStatus() {
+  // 面板收起时丢掉旧诊断，下次展开重新拉取，避免索引状态变化后还显示过期数据。
+  const diagnosticTask = qaDiagnosticOpen.value ? fetchQaDiagnostic() : Promise.resolve()
+  if (!qaDiagnosticOpen.value) qaDiagnostic.value = null
+  try {
+    qaStatus.value = await getPaperQaStatus(paperId.value)
   } catch (error) {
     console.error('Failed to fetch QA status:', error)
     qaStatus.value = { arxiv_id: paperId.value, has_index: false, status: 'not_indexed' }
-    qaDiagnostic.value = null
   }
+  await diagnosticTask
 }
 
 async function handleRefreshQaState() {
@@ -481,20 +499,30 @@ async function handleResumeSession(sessionId: string) {
   await loadSession(sessionId)
 }
 
-onMounted(async () => {
-  syncViewport()
-  window.addEventListener('resize', syncViewport)
+// 详情页各块数据互不依赖，全部并发请求；串行时每一步都要多等一个网络往返。
+// 研究画像随偏好接口一起返回（fetchPaperById 内写入 store），不再单独请求同一份数据。
+async function loadPageData() {
+  loading.value = true
   try {
-    await Promise.all([store.fetchResearchProfile(), store.fetchPaperActions()])
-    await store.fetchPaperById(paperId.value)
-    await fetchQaStatus()
-    await resumeLatestQaJobPolling()
-    await loadRecentSession()
-  } catch (error) {
-    console.error('Failed to fetch paper:', error)
+    const results = await Promise.allSettled([
+      store.fetchPaperById(paperId.value),
+      store.fetchPaperActions(),
+      fetchQaStatus(),
+      resumeLatestQaJobPolling(),
+      loadRecentSession()
+    ])
+    for (const result of results) {
+      if (result.status === 'rejected') console.error('Failed to fetch paper:', result.reason)
+    }
   } finally {
     loading.value = false
   }
+}
+
+onMounted(async () => {
+  syncViewport()
+  window.addEventListener('resize', syncViewport)
+  await loadPageData()
 })
 
 onBeforeUnmount(() => {
@@ -506,19 +534,10 @@ onBeforeUnmount(() => {
 
 watch(paperId, async () => {
   stopQaJobPolling()
-  loading.value = true
-  try {
-    await Promise.all([store.fetchResearchProfile(), store.fetchPaperActions()])
-    await store.fetchPaperById(paperId.value)
-    await fetchQaStatus()
-    await resumeLatestQaJobPolling()
-    resetChat()
-    await loadRecentSession()
-  } catch (error) {
-    console.error('Failed to fetch paper:', error)
-  } finally {
-    loading.value = false
-  }
+  // 并发加载前先清掉上一篇的对话和诊断，避免新论文的请求返回前短暂显示旧数据。
+  resetChat()
+  qaDiagnostic.value = null
+  await loadPageData()
 })
 </script>
 
@@ -805,9 +824,9 @@ watch(paperId, async () => {
             </div>
           </div>
 
-          <div v-if="isAdmin" class="surface side-card">
-            <div class="side-title">索引诊断</div>
-            <div v-if="qaDiagnostic" class="diagnostic-block">
+          <details v-if="isAdmin" class="surface side-card side-help" @toggle="handleDiagnosticToggle">
+            <summary class="side-title">索引诊断</summary>
+            <div v-if="qaDiagnostic" class="diagnostic-block diagnostic-body">
               <div class="kv-list">
                 <div class="kv-row">
                   <span>Collection</span>
@@ -868,8 +887,10 @@ watch(paperId, async () => {
                 </div>
               </details>
             </div>
-            <div v-else class="muted diagnostic-empty">暂无诊断数据，点击「刷新状态」加载。</div>
-          </div>
+            <div v-else class="muted diagnostic-empty diagnostic-body">
+              {{ qaDiagnosticLoading ? '诊断加载中…' : '暂无诊断数据，点击「刷新状态」重新加载。' }}
+            </div>
+          </details>
 
           <details class="surface side-card side-help">
             <summary class="side-title">问答是如何工作的</summary>
@@ -1400,6 +1421,11 @@ watch(paperId, async () => {
 
 .diagnostic-empty {
   font-size: 12.5px;
+}
+
+/* 诊断卡复用 side-help 的折叠样式，其 summary 去掉了下边距，内容需要自己留出间隔。 */
+.diagnostic-body {
+  margin-top: 10px;
 }
 
 .side-help summary {
