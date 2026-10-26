@@ -313,6 +313,7 @@ def check_local_directories() -> DoctorResult:
         BACKEND_ROOT / "02-embedded-docs",
         BACKEND_ROOT / "03-vector-store",
         BACKEND_ROOT / "03-docling-assets",
+        BACKEND_ROOT / "03-fulltext-cache",
         BACKEND_ROOT / "05-generation-results",
         BACKEND_ROOT / "06-daily-arxiv-paper",
         BACKEND_ROOT / "06-database",

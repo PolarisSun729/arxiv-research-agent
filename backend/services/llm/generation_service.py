@@ -465,13 +465,16 @@ class GenerationService:
 
     def stream_with_qwen(
         self,
-        prompt: str,
+        prompt: Any,
         model_name: Optional[str] = None,
         task_type: Optional[str] = None,
         enable_thinking: bool = False,
+        usage_sink: Optional[Dict[str, Any]] = None,
     ) -> Iterator[str]:
-        """单轮流式补全，逐段产出模型输出的文本增量。
+        """流式补全，逐段产出模型输出的文本增量。
 
+        prompt 为字符串时按单轮用户输入发送；也可以直接传 Responses API 的输入消息列表（多消息、图文混排）。
+        usage_sink 不为空时，结束后写入模型返回的完整用量（含缓存命中的 token 明细）。
         默认关闭思考：面向用户逐字展示的场景开思考会先产出数千 token 推理，首字要等几十秒。
         """
         if not QWEN_API_KEY:
@@ -497,7 +500,10 @@ class GenerationService:
                 if delta:
                     yield delta
             elif event_type == "response.completed":
-                record_llm_usage(getattr(getattr(event, "response", None), "usage", None))
+                usage = getattr(getattr(event, "response", None), "usage", None)
+                record_llm_usage(usage)
+                if usage_sink is not None and usage is not None:
+                    usage_sink.update(usage.model_dump() if hasattr(usage, "model_dump") else dict(usage))
 
     def rewrite_query_for_retrieval(
         self,

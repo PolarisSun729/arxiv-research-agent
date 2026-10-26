@@ -1,12 +1,13 @@
-"""在隔离子进程中执行重型解析任务（目前用于 Docling），保证子进程出问题时只影响当前任务。
+"""在隔离子进程中执行重型解析任务（Docling 建索引、快速问答全文解析），保证子进程出问题时只影响当前任务。
 
 设计目标：子进程内存不足、卡住或崩溃时，只让这一次调用失败，Web 进程不受拖累，也不留下残余进程。
 
 1. 超时强杀：父进程最多等待 timeout_seconds；超时先 terminate，宽限期后 kill，最后一定 join 回收。
 2. 生命周期绑定：Linux 下子进程通过 PR_SET_PDEATHSIG 绑定父进程，gunicorn worker 被杀时子进程随之退出，
    不会再变成占着内存的孤儿进程。
-3. 全局互斥：同一时间最多运行一个子进程。进程内用 threading.Lock，跨进程用 flock 文件锁；
+3. 并发名额：默认全局互斥，同一时间最多运行一个子进程。进程内用 threading.Lock，跨进程用 flock 文件锁；
    flock 在持有者进程退出时由内核自动释放，不会因 worker 被杀而残留死锁。
+   调用方可传入自己的信号量（process_slots），与默认的全局互斥互不占用名额。
 4. 优先被 OOM 选中：子进程把 oom_score_adj 调到最大，cgroup 内存超限时内核优先杀它而不是 Web worker。
 """
 
@@ -66,23 +67,28 @@ def run_in_isolated_subprocess(
     lock_path: Optional[str],
     lock_timeout_seconds: float,
     task_label: str = "isolated subprocess",
+    process_slots: Optional[threading.Semaphore] = None,
 ) -> Any:
     """在 spawn 出的子进程中执行 target(*args) 并返回其结果。
 
     target 和 args 必须可被 pickle（模块级函数）；返回值同样经 pickle 传回父进程。
+    process_slots 为进程内并发名额，缺省时与 Docling 解析共用全局互斥锁。
 
     注意：PR_SET_PDEATHSIG 绑定的是创建子进程的线程而不是整个进程。调用方线程在子进程运行期间
     一直阻塞在本函数里，因此线程先于子进程退出的情况不会发生；不要改成"启动后立即返回"的用法。
     """
-    with _exclusive_slot(lock_path, lock_timeout_seconds, task_label):
+    slots = process_slots if process_slots is not None else _process_lock
+    with _exclusive_slot(slots, lock_path, lock_timeout_seconds, task_label):
         return _run_child(target, args, timeout_seconds=timeout_seconds, task_label=task_label)
 
 
 @contextmanager
-def _exclusive_slot(lock_path: Optional[str], timeout_seconds: float, task_label: str) -> Iterator[None]:
-    """获取进程内锁与跨进程文件锁；两者共用同一个截止时间。"""
+def _exclusive_slot(
+    slots: Any, lock_path: Optional[str], timeout_seconds: float, task_label: str
+) -> Iterator[None]:
+    """获取进程内名额与跨进程文件锁；两者共用同一个截止时间。"""
     deadline = time.monotonic() + max(0.0, timeout_seconds)
-    if not _process_lock.acquire(timeout=max(0.0, timeout_seconds)):
+    if not slots.acquire(timeout=max(0.0, timeout_seconds)):
         raise IsolatedSubprocessError("busy", f"{task_label}: 等待 {timeout_seconds:.0f} 秒仍有其他解析任务在运行")
     try:
         if fcntl is None or not lock_path:
@@ -106,7 +112,7 @@ def _exclusive_slot(lock_path: Optional[str], timeout_seconds: float, task_label
             # 关闭文件描述符即释放 flock。
             os.close(fd)
     finally:
-        _process_lock.release()
+        slots.release()
 
 
 def _run_child(target: Callable[..., Any], args: tuple, *, timeout_seconds: float, task_label: str) -> Any:

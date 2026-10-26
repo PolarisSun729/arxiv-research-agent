@@ -14,6 +14,8 @@ class _DependencyBag:
         self.generation_service: Any = None
         self.recommendation_service: Any = None
         self.paper_qa_service: Any = None
+        self.paper_fast_qa_service: Any = None
+        self.paper_fulltext_service: Any = None
         self.arxiv_service: Any = None
 
 
@@ -245,6 +247,8 @@ def _ensure_dependency_stubs() -> None:
     dependencies_module.get_generation_service = lambda: DEPENDENCY_BAG.generation_service
     dependencies_module.get_recommendation_service = lambda: DEPENDENCY_BAG.recommendation_service
     dependencies_module.get_paper_qa_service = lambda: DEPENDENCY_BAG.paper_qa_service
+    dependencies_module.get_paper_fast_qa_service = lambda: DEPENDENCY_BAG.paper_fast_qa_service
+    dependencies_module.get_paper_fulltext_service = lambda: DEPENDENCY_BAG.paper_fulltext_service
     dependencies_module.get_arxiv_search_backend = lambda: DEPENDENCY_BAG.arxiv_service
     dependencies_module.get_memory_service = getattr(dependencies_module, "get_memory_service", lambda: None)
     sys.modules["dependencies"] = dependencies_module

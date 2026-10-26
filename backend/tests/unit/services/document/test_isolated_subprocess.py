@@ -3,6 +3,7 @@ import os
 import signal
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -132,6 +133,35 @@ class IsolatedSubprocessTests(unittest.TestCase):
                 self._run(_echo, 1, lock_timeout_seconds=0.2)
         finally:
             isolated_subprocess._process_lock.release()
+        self.assertEqual(caught.exception.reason, "busy")
+
+    def test_own_process_slots_do_not_wait_for_global_lock(self):
+        slots = threading.BoundedSemaphore(1)
+        acquired = isolated_subprocess._process_lock.acquire(timeout=5)
+        self.assertTrue(acquired)
+        try:
+            result = run_in_isolated_subprocess(
+                _echo,
+                1,
+                timeout_seconds=30.0,
+                lock_path=None,
+                lock_timeout_seconds=0.2,
+                process_slots=slots,
+            )
+        finally:
+            isolated_subprocess._process_lock.release()
+        self.assertEqual(result, 1)
+
+    def test_busy_when_own_process_slots_are_used_up(self):
+        slots = threading.BoundedSemaphore(1)
+        slots.acquire()
+        try:
+            with self.assertRaises(IsolatedSubprocessError) as caught:
+                run_in_isolated_subprocess(
+                    _echo, 1, timeout_seconds=30.0, lock_path=None, lock_timeout_seconds=0.2, process_slots=slots
+                )
+        finally:
+            slots.release()
         self.assertEqual(caught.exception.reason, "busy")
 
     @unittest.skipIf(fcntl is None, "flock 仅在 POSIX 平台可用")

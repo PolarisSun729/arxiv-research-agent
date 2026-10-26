@@ -5,8 +5,9 @@
 2. 检索 trace 导出与诊断；
 3. 论文聊天会话及消息管理；
 4. 论文笔记的创建、编辑、导出；
-5. 同步问答与流式问答；
-6. 证据图片资源读取。
+5. 同步问答与流式问答（快速模式：整篇全文直接作答；详细模式：基于索引的证据研究）；
+6. 快速问答的全文状态查询与预解析；
+7. 证据图片资源读取。
 
 整体设计上，路由层尽量保持轻量，主要承担参数整理、对象序列化、
 错误码转换和响应结构统一，复杂业务则下沉到 service 层实现。
@@ -22,7 +23,8 @@
 - 聊天会话：GET/POST /chat-sessions、GET /chat-sessions/recent、
   GET/DELETE /chat-sessions/{session_id}、GET /chat-sessions/{session_id}/messages、
   POST /chat-sessions/{session_id}/clear；
-- 问答：POST /qa（非流式）、POST /qa/stream（SSE 流式）；
+- 问答：POST /qa（非流式）、POST /qa/stream（SSE 流式），请求体 mode 选择 fast / research；
+- 快速问答全文：GET /fast-qa/status、POST /fast-qa/prepare；
 - 证据资源：GET /evidence-assets/{source_id}。
 """
 
@@ -31,7 +33,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, Literal, Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
@@ -43,6 +45,8 @@ from dependencies import (
     get_index_job_manager,
     get_paper_chat_message_store,
     get_paper_chat_session_store,
+    get_paper_fast_qa_service,
+    get_paper_fulltext_service,
     get_paper_qa_index_store,
     get_paper_qa_service,
     get_vector_store_service,
@@ -73,6 +77,9 @@ class QaRequest(BaseModel):
     便于调试不同召回/排序链路的效果。
     """
     question: str
+    # fast：整篇论文全文直接送入模型，不需要索引；research：基于 QA 索引的证据研究，逐条核对引用。
+    # 缺省为 research，保持旧客户端和 Agent 工具的行为不变。
+    mode: Literal["fast", "research"] = "research"
     user_id: Optional[str] = None
     session_id: Optional[str] = None
     top_k: Optional[int] = None
@@ -566,6 +573,8 @@ async def qa_paper(arxiv_id: str, payload: QaRequest, paper_qa_service=Depends(g
     """
     prepare_paper_qa(arxiv_id, payload)
     try:
+        if payload.mode == "fast":
+            return _consume_stream_result(get_paper_fast_qa_service().answer_stream(arxiv_id, payload))
         return paper_qa_service.answer_question(arxiv_id, payload)
     except AppError as exc:
         logger.warning(
@@ -598,9 +607,14 @@ async def get_evidence_asset(
     source_id: str,
     paper_qa_service=Depends(get_paper_qa_service),
 ):
-    """按论文和稳定 source_id 返回图片，不允许客户端传入任意服务器路径。"""
+    """按论文和稳定 source_id 返回图片，不允许客户端传入任意服务器路径。
+
+    快速模式的块 ID（fig-N、pX-Y）从全文缓存里找，其余按详细模式的 QA 索引查找。
+    """
     try:
-        asset_path = paper_qa_service.resolve_evidence_asset_path(arxiv_id, source_id)
+        asset_path = get_paper_fulltext_service().resolve_image_path(arxiv_id, source_id)
+        if asset_path is None:
+            asset_path = paper_qa_service.resolve_evidence_asset_path(arxiv_id, source_id)
         suffix = Path(asset_path).suffix.lower()
         media_type = {
             ".png": "image/png",
@@ -624,10 +638,12 @@ async def qa_paper_stream(
     payload: QaRequest,
     paper_qa_service=Depends(get_paper_qa_service),
 ):
-    """执行流式论文问答，把证据研究引擎的阶段事件转换为 SSE 推送给前端。"""
+    """执行流式论文问答：快速模式透传全文作答的增量，详细模式把证据研究引擎的阶段事件转换为 SSE。"""
     prepare_paper_qa(arxiv_id, payload)
     question = payload.question.strip()
-    logger.debug("QA stream request for paper: %s, question: %s", arxiv_id, question)
+    logger.debug("QA stream request for paper: %s, mode: %s, question: %s", arxiv_id, payload.mode, question)
+    if payload.mode == "fast":
+        return _sse_response(_fast_event_stream(arxiv_id, payload))
 
     def event_stream():
         """把证据研究引擎的事件映射为前端约定的 SSE 事件。
@@ -697,8 +713,43 @@ async def qa_paper_stream(
                 context={"arxiv_id": arxiv_id, "qa_observation": observation},
             ).to_payload())
 
+    return _sse_response(event_stream())
+
+
+def _fast_event_stream(arxiv_id: str, payload: QaRequest):
+    """快速模式的服务事件已经是对外格式（meta / progress / delta / done），这里只做序列化与错误收口。
+
+    同步生成器，由 StreamingResponse 放到线程池中迭代；每一帧都经 format_sse_event 脱敏。
+    """
+    try:
+        for event in get_paper_fast_qa_service().answer_stream(arxiv_id, payload):
+            event_type = event.get("event", "unknown")
+            event_data = event.get("data", {})
+            if event_type == "done":
+                event_data = dict(event_data)
+                event_data["chat_session"] = _serialize_chat_session(event_data.get("chat_session") or {})
+            yield format_sse_event(event_type, event_data)
+    except AppError as exc:
+        yield format_sse_event("error", exc.to_payload())
+    except Exception:
+        logger.exception("Error in fast QA stream: arxiv_id=%s", arxiv_id)
+        yield format_sse_event("error", AppError(
+            ErrorCode.UNKNOWN_ERROR, detail={"stage": "fast_qa_stream"}, context={"arxiv_id": arxiv_id},
+        ).to_payload())
+
+
+def _consume_stream_result(stream):
+    """非流式入口消费同一条执行流；显式捕获 return，避免 for 吞掉最终结果。"""
+    while True:
+        try:
+            next(stream)
+        except StopIteration as stop:
+            return stop.value
+
+
+def _sse_response(events) -> StreamingResponse:
     return StreamingResponse(
-        event_stream(),
+        events,
         media_type="text/event-stream",
         headers={
             # SSE 需要禁用缓存和代理缓冲，否则前端可能收不到实时增量。
@@ -707,3 +758,21 @@ async def qa_paper_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.get("/fast-qa/status")
+def get_fast_qa_status(arxiv_id: str):
+    """快速问答的全文准备状态：ready / queued / parsing / failed / not_parsed。"""
+    try:
+        return get_paper_fulltext_service().get_status(arxiv_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="paper not found")
+
+
+@router.post("/fast-qa/prepare")
+def prepare_fast_qa(arxiv_id: str):
+    """打开论文详情页时触发预解析，立即返回当前状态；排队已满时返回 busy，提问时会再次触发。"""
+    try:
+        return get_paper_fulltext_service().request_parse(arxiv_id, priority=False)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="paper not found")

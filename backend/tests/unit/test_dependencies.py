@@ -21,7 +21,10 @@ class DependenciesUnitTests(unittest.TestCase):
         self.assertIsInstance(getters, list)
         self.assertGreaterEqual(len(getters), 10)
         self.assertEqual(getters[0][0], "storage_container")
-        self.assertEqual(getters[-1][0], "paper_qa_service")
+        names = [name for name, _ in getters]
+        # 快速问答复用详细模式的会话服务，预热时必须排在 paper_qa_service 之后。
+        self.assertEqual(names[-1], "paper_fast_qa_service")
+        self.assertLess(names.index("paper_qa_service"), names.index("paper_fast_qa_service"))
         self.assertTrue(all(isinstance(name, str) and callable(getter) for name, getter in getters))
 
     def test_warm_up_services_lazy_mode_returns_empty_without_touching_getters(self) -> None:
