@@ -1,5 +1,5 @@
 import { ElMessage } from 'element-plus'
-import { reactive, ref, toValue, watch, type MaybeRefOrGetter } from 'vue'
+import { computed, reactive, ref, toValue, watch, type MaybeRefOrGetter } from 'vue'
 import {
   clearPaperChatSession,
   createPaperChatSession,
@@ -14,7 +14,9 @@ import type {
   PaperChatMessage,
   PaperChatSession,
   QaConversationContextTurn,
-  QaRequestOptions
+  QaMode,
+  QaRequestOptions,
+  QaStreamProgressPayload
 } from '@/api/papers'
 import type {
   QaPersistenceStatus,
@@ -28,6 +30,31 @@ const MAX_CONVERSATION_TURNS = 5
 const MAX_ANSWER_SUMMARY_LENGTH = 280
 const MAX_SOURCE_CONTENT_LENGTH = 180
 const MAX_SOURCES_PER_TURN = 3
+const ANSWER_MODE_STORAGE_KEY = 'arxiv_paper_qa_mode'
+
+function readStoredAnswerMode(): QaMode {
+  try {
+    return window.localStorage.getItem(ANSWER_MODE_STORAGE_KEY) === 'research' ? 'research' : 'fast'
+  } catch {
+    return 'fast'
+  }
+}
+
+function storeAnswerMode(mode: QaMode) {
+  try {
+    window.localStorage.setItem(ANSWER_MODE_STORAGE_KEY, mode)
+  } catch {
+    // 模式偏好只是便利项，写不进去时保持当前会话内的选择即可。
+  }
+}
+
+function describeProgress(progress: QaStreamProgressPayload): string | null {
+  if (progress.stage === 'parsing') {
+    const waited = Number(progress.waited_seconds || 0)
+    return waited > 0 ? `正在读取论文全文（已等待 ${waited} 秒）` : '正在读取论文全文'
+  }
+  return null
+}
 
 function getMemoryConfig() {
   return {
@@ -55,6 +82,8 @@ interface UsePaperRagChatOptions {
   onEnterQaMode?: () => void
   onScrollToBottom?: () => void
   userId?: MaybeRefOrGetter<string>
+  // 详细模式依赖问答索引；没有索引时无论偏好如何都按快速模式提问。
+  canUseResearch?: MaybeRefOrGetter<boolean>
 }
 
 function truncateText(value: string | undefined, maxLength: number) {
@@ -128,6 +157,7 @@ function groupMessagesToTurns(messages: PaperChatMessage[], paperId: string): Qa
       existing.answer = message.content || existing.answer
       existing.sources = normalizeEvidenceSources(message.sources, paperId)
       existing.retrievalDebug = message.retrieval_debug_snapshot ?? existing.retrievalDebug
+      existing.mode = existing.retrievalDebug?.engine === 'fast_fulltext' ? 'fast' : 'research'
       existing.contextualizedQuestion = message.contextualized_question || existing.contextualizedQuestion
       existing.questionContextualization = message.question_contextualization ?? existing.questionContextualization
       existing.usedShortTermMemory = Boolean(
@@ -211,6 +241,10 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
   const availableSessions = ref<PaperChatSession[]>([])
   const activeStreamController = ref<AbortController | null>(null)
   const activeAbortIntent = ref<'user' | 'cleanup' | null>(null)
+  const answerMode = ref<QaMode>(readStoredAnswerMode())
+  const effectiveAnswerMode = computed<QaMode>(() =>
+    answerMode.value === 'research' && toValue(options.canUseResearch ?? true) ? 'research' : 'fast'
+  )
   const retrievalOptions = reactive<PaperRagRetrievalOptions>({
     enableQueryRewrite: true,
     enableHyde: false,
@@ -227,6 +261,11 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
   function getUserId() {
     const resolved = options.userId ? toValue(options.userId) : userContext.userId.value
     return String(resolved || userContext.defaultUserId).trim() || userContext.defaultUserId
+  }
+
+  function setAnswerMode(mode: QaMode) {
+    answerMode.value = mode
+    storeAnswerMode(mode)
   }
 
   function openEvidence(turn: QaTurn) {
@@ -388,6 +427,7 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
     if (!currentPaperId) return
 
     qaLoading.value = true
+    const mode = effectiveAnswerMode.value
 
     const turn = reactive<QaTurn>({
       id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
@@ -408,7 +448,9 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
       usedShortTermMemory: false,
       questionContextualization: null,
       citedSourceIds: [],
-      citationWarning: null
+      citationWarning: null,
+      mode,
+      progressText: null
     })
     qaResults.value.push(turn)
     question.value = ''
@@ -420,6 +462,7 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
     try {
       const conversationContext = buildConversationContext(qaResults.value, turn.id)
       const requestOptions: QaRequestOptions = {
+        mode,
         user_id: getUserId(),
         session_id: memoryConfig.enablePaperChatSession ? currentSession.value?.session_id : undefined,
         top_k: retrievalOptions.topK,
@@ -468,8 +511,12 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
             }
             scrollToBottom()
           },
+          onProgress: progress => {
+            turn.progressText = describeProgress(progress)
+          },
           onDelta: delta => {
             turn.status = 'streaming'
+            turn.progressText = null
             turn.answer += delta
             scrollToBottom()
           },
@@ -622,6 +669,9 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
     currentSession,
     availableSessions,
     retrievalOptions,
+    answerMode,
+    effectiveAnswerMode,
+    setAnswerMode,
     submitQuestion,
     resubmitTurn,
     cancelCurrentStream,

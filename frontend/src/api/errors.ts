@@ -26,6 +26,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   paper_not_found: '未找到对应论文，请确认论文 ID 是否正确。',
   qa_index_not_found: '这篇论文还没有 QA 索引，请先构建索引。',
   qa_index_build_failed: '论文 QA 索引构建失败，可以重新构建。',
+  paper_too_long_for_fast_qa: '这篇论文超出了快速模式的模型输入上限，请改用详细模式。',
   vector_store_error: '检索服务异常，请稍后重试。',
   llm_generation_failed: '答案生成失败，请稍后重试。',
   aborted: '已取消生成',

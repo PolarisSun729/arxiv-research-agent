@@ -3,6 +3,8 @@ export type ApiErrorCode =
   | 'paper_not_found'
   | 'qa_index_not_found'
   | 'qa_index_build_failed'
+  | 'paper_fulltext_unavailable'
+  | 'paper_too_long_for_fast_qa'
   | 'vector_store_error'
   | 'llm_generation_failed'
   | 'aborted'

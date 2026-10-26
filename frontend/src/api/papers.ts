@@ -562,6 +562,24 @@ export async function getPaperQaStatus(arxivId: string): Promise<QaStatusResult>
   return request.get(`/paper/${arxivId}/qa-status`)
 }
 
+/** 快速问答的全文准备状态；busy 表示预解析队列已满，提问时仍会优先读取。 */
+export interface FastQaFulltextStatus {
+  status: 'ready' | 'queued' | 'parsing' | 'failed' | 'not_parsed' | 'busy'
+  reason?: string
+  page_count?: number
+  image_count?: number
+  char_count?: number
+}
+
+export async function getFastQaFulltextStatus(arxivId: string): Promise<FastQaFulltextStatus> {
+  return request.get(`/paper/${arxivId}/fast-qa/status`)
+}
+
+// 打开详情页即触发全文预解析，用户提问时多半已经读完；已缓存时直接返回 ready。
+export async function prepareFastQaFulltext(arxivId: string): Promise<FastQaFulltextStatus> {
+  return request.post(`/paper/${arxivId}/fast-qa/prepare`)
+}
+
 export interface QaDiagnosticCollectionInfo {
   name?: string
   exists_in_milvus?: boolean
@@ -841,7 +859,11 @@ export interface QaConversationContextTurn {
   }>
 }
 
+/** fast：整篇论文交给模型直接作答；research：检索 + 逐句核对，需要问答索引。 */
+export type QaMode = 'fast' | 'research'
+
 export interface QaRequestOptions {
+  mode?: QaMode
   user_id?: string
   session_id?: string
   top_k?: number
@@ -976,6 +998,24 @@ export interface RetrievalDebug {
   removed_claims?: ResearchRemovedClaimDebug[]
   /** 部分回答正文的生成方式：in_place 原位删除未受支持句子；joined_supported_claims 拼接受支持主张。 */
   answer_pruning?: 'in_place' | 'joined_supported_claims' | string | null
+  // 以下为快速模式（engine 为 fast_fulltext）的执行记录。
+  fulltext?: FastQaFulltextDebug
+  input?: { request_bytes?: number; image_count?: number; images_downscaled?: boolean }
+  usage?: Record<string, any> | null
+  history_turn_count?: number
+  wait_fulltext_ms?: number
+  first_token_ms?: number | null
+  generation_ms?: number
+  invalid_citation_ids?: string[]
+}
+
+export interface FastQaFulltextDebug {
+  page_count?: number
+  char_count?: number
+  image_count?: number
+  parse_seconds?: number
+  pdf_sha256?: string
+  parser?: Record<string, any> | string | null
 }
 
 /** 部分回答里因缺少证据支持而从正文删掉的句子，带校验结论与中文原因。 */
@@ -1142,7 +1182,10 @@ type QaStreamDonePayload = QaStreamMetaPayload & {
 }
 
 export interface QaStreamProgressPayload {
-  stage: 'retrieval' | 'draft' | 'verification' | 'completed'
+  // parsing / generating 来自快速模式：等待全文读取、开始生成。
+  stage: 'retrieval' | 'draft' | 'verification' | 'completed' | 'parsing' | 'generating'
+  status?: string
+  waited_seconds?: number
   retrieval_count?: number
   new_candidate_count?: number
   draft_attempt?: number

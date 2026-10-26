@@ -20,6 +20,8 @@ type RagChatPanelMessage = AgentChatMessage & {
   citedSourceIds?: string[]
   // 没有正文时的说明，由调用方按这一轮停在哪里给出；缺省用通用文案。
   emptyText?: string
+  // 还没有正文时的等待说明；缺省用“正在生成回复”。
+  loadingText?: string
   retrievalDebug?: RetrievalDebug | null
   response?: QaTurnForRagChat | unknown | null
 }
@@ -253,7 +255,7 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
               class="rag-chat-panel__thinking"
               :model-value="true"
               status="thinking"
-              content="正在生成回复"
+              :content="item.loadingText || '正在生成回复'"
               :auto-collapse="false"
             />
           </template>
