@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     from services.llm.abstract_translation_service import AbstractTranslationService
     from services.llm.generation_service import GenerationService
     from services.memory import MemoryService
+    from services.paper_fast_qa.fast_answer_service import PaperFastQAService
+    from services.paper_fast_qa.fulltext_service import PaperFulltextService
     from services.paper_qa.index_job_manager import IndexJobManager
     from services.paper_qa.paper_qa_index_builder import PaperQAIndexBuilder
     from services.paper_qa.paper_qa_service import PaperQAService
@@ -453,6 +455,40 @@ def get_paper_qa_service() -> PaperQAService:
     )
 
 
+@lru_cache(maxsize=1)
+def get_paper_fulltext_service() -> PaperFulltextService:
+    from services.paper_fast_qa.fulltext_service import PaperFulltextService
+    from utils.config import PAPER_FAST_QA_CONFIG
+
+    def download_pdf(arxiv_id: str) -> str:
+        return get_arxiv_api_service().download_pdf(f"https://arxiv.org/pdf/{arxiv_id}.pdf", arxiv_id)
+
+    return PaperFulltextService(
+        cache_dir=PAPER_FAST_QA_CONFIG["cache_dir"],
+        pdf_provider=download_pdf,
+        parse_concurrency=PAPER_FAST_QA_CONFIG["parse_concurrency"],
+        parse_queue_limit=PAPER_FAST_QA_CONFIG["parse_queue_limit"],
+        parse_timeout_seconds=PAPER_FAST_QA_CONFIG["parse_timeout_seconds"],
+        failure_cooldown_seconds=PAPER_FAST_QA_CONFIG["failure_cooldown_seconds"],
+        image_dpi=PAPER_FAST_QA_CONFIG["image_dpi"],
+    )
+
+
+@lru_cache(maxsize=1)
+def get_paper_fast_qa_service() -> PaperFastQAService:
+    from services.paper_fast_qa.fast_answer_service import PaperFastQAService
+    from utils.config import PAPER_FAST_QA_CONFIG
+
+    return PaperFastQAService(
+        fulltext_service=get_paper_fulltext_service(),
+        generation_service=get_generation_service(),
+        # 与详细模式共用会话与 turn 存储，两种模式的问答在同一个对话里连续记录。
+        session_service=get_paper_qa_service().session_service,
+        ask_wait_seconds=PAPER_FAST_QA_CONFIG["ask_wait_seconds"],
+        history_turns=PAPER_FAST_QA_CONFIG["history_turns"],
+    )
+
+
 def normalize_service_load_mode(load_mode: str | None = None) -> str:
     mode = str(load_mode or SERVICE_LOAD_MODE or "lazy").strip().lower()
     if mode in {"preload", "eager", "startup", "startup-load"}:
@@ -476,6 +512,8 @@ def iter_service_getters() -> list[tuple[str, Callable[[], Any]]]:
         ("index_job_manager", get_index_job_manager),
         ("recommendation_service", get_recommendation_service),
         ("paper_qa_service", get_paper_qa_service),
+        ("paper_fulltext_service", get_paper_fulltext_service),
+        ("paper_fast_qa_service", get_paper_fast_qa_service),
     ]
 
 

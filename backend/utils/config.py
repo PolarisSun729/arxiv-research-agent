@@ -7,7 +7,7 @@ from typing import Any, Dict
 from dotenv import load_dotenv
 
 from utils.agent_planner_limits import AGENT_PLANNER_LIMITS
-from utils.storage_paths import BACKEND_DATA_ROOT, resolve_storage_path
+from utils.storage_paths import BACKEND_DATA_ROOT, BACKEND_FULLTEXT_CACHE_ROOT, resolve_storage_path
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -223,6 +223,29 @@ PAPER_QA_BUILD_CACHE_CONFIG: Dict[str, Any] = {
     "embedding_size_limit": _env_int("PAPER_QA_EMBEDDING_CACHE_SIZE_LIMIT", 2 * 1024 * 1024 * 1024),
     # per-chunk LLM 调用互不依赖，默认小并发提速，同时避免把 provider 限流压力放大到不可控。
     "llm_max_workers": _env_int("PAPER_QA_BUILD_LLM_MAX_WORKERS", 4),
+}
+
+PAPER_FAST_QA_CONFIG: Dict[str, Any] = {
+    # 快速问答把整篇论文全文和图片直接送入模型，不建索引；全文解析结果按论文缓存，所有用户共用。
+    "cache_dir": resolve_storage_path(
+        _env_str("PAPER_FAST_QA_CACHE_DIR"),
+        default_path=BACKEND_FULLTEXT_CACHE_ROOT,
+    ),
+    # 解析在独立子进程中运行，与 Docling 建索引各用各的并发名额；单篇峰值内存约 0.4～0.7G，并发数要按机器内存调整。
+    "parse_concurrency": _env_int("PAPER_FAST_QA_PARSE_CONCURRENCY", 2),
+    # 只限制打开详情页触发的预解析排队数；用户提问触发的解析不受限，并排在预解析前面。
+    "parse_queue_limit": _env_int("PAPER_FAST_QA_PARSE_QUEUE_LIMIT", 20),
+    # 实测单篇最慢 60 秒（49 页）；两篇同时解析时 CPU 争用使单篇耗时涨到原来的约 6 倍（19 秒 → 2 分钟），
+    # 按最慢单篇乘 6 约 6 分钟，再给比开发机慢的服务器留余量。
+    "parse_timeout_seconds": _env_int("PAPER_FAST_QA_PARSE_TIMEOUT_SECONDS", 600),
+    # 提问时全文还没解析好，最多等这么久；超时本轮报错，解析任务继续在后台跑。
+    "ask_wait_seconds": _env_int("PAPER_FAST_QA_ASK_WAIT_SECONDS", 120),
+    # 解析失败后这段时间内不再重试，避免同一篇坏 PDF 被反复解析占满名额。
+    "failure_cooldown_seconds": _env_int("PAPER_FAST_QA_FAILURE_COOLDOWN_SECONDS", 300),
+    # 图片、公式按 2 倍分辨率（144 dpi）渲染，保证图中小字可读。
+    "image_dpi": _env_int("PAPER_FAST_QA_IMAGE_DPI", 144),
+    # 带入最近几轮对话，供追问理解指代。
+    "history_turns": _env_int("PAPER_FAST_QA_HISTORY_TURNS", 3),
 }
 
 PROFILE_EVIDENCE_CONFIG: Dict[str, Any] = {
@@ -843,11 +866,12 @@ GENERATION_CONFIG: Dict[str, Any] = {
     # 每次生成的完整上下文与回答落盘到 05-generation-results，仅供调试复盘；
     # 文件含用户问题和回答原文且没有清理机制，默认关闭，排查时再临时打开。
     "save_generation_results": _env_bool("SAVE_GENERATION_RESULTS", False),
-    # Responses API 多模态请求：请求体上限是 base64 图片的传输限制（DashScope 约 6MB），不是上下文限制；
-    # 图片数量按 256K 上下文放开，单图目标字节会按剩余请求体预算自适应压缩。
-    "qwen_responses_max_image_count": _env_int("QWEN_RESPONSES_MAX_IMAGE_COUNT", 30),
-    "qwen_responses_request_body_limit_bytes": _env_int("QWEN_RESPONSES_REQUEST_BODY_LIMIT_BYTES", 6_291_456),
-    "qwen_responses_request_body_soft_limit_bytes": _env_int("QWEN_RESPONSES_REQUEST_BODY_SOFT_LIMIT_BYTES", 5_500_000),
+    # Responses API 多模态请求按百炼官方限制设置（https://help.aliyun.com/zh/model-studio/vision）：
+    # dashscope.aliyuncs.com 域名请求体上限 16 MiB（工作空间域名 64MB），Base64 传图单次最多 250 张；
+    # 软上限预留 1 MiB 给 JSON 包装和文本，单图目标字节会按剩余请求体预算自适应压缩。
+    "qwen_responses_max_image_count": _env_int("QWEN_RESPONSES_MAX_IMAGE_COUNT", 250),
+    "qwen_responses_request_body_limit_bytes": _env_int("QWEN_RESPONSES_REQUEST_BODY_LIMIT_BYTES", 16 * 1024 * 1024),
+    "qwen_responses_request_body_soft_limit_bytes": _env_int("QWEN_RESPONSES_REQUEST_BODY_SOFT_LIMIT_BYTES", 15 * 1024 * 1024),
     "qwen_responses_image_target_bytes": _env_int("QWEN_RESPONSES_IMAGE_TARGET_BYTES", 1_500_000),
     # 任务到模型角色的路由表只保留在配置层，业务代码只负责读取，不再硬编码模型名。
     "task_model_roles": {
@@ -865,6 +889,7 @@ GENERATION_CONFIG: Dict[str, Any] = {
         "paper_summary": "large",  # 生成论文的综合性摘要
         "paper_detail": "large",  # 生成方法或技术细节的详尽说明
         "paper_qa": "large",  # 处理关于具体论文的问答
+        "paper_fast_qa": "large",  # 快速问答：整篇论文全文送入模型直接作答
         "recommendation_generation": "large",  # 生成个性化推荐文本或推荐理由
         "general_generation": "large",  # 用于复杂自然语言输出的一般大模型生成
         "research_claim_extraction": "large",  # 研究引擎把草稿拆成可校验主张并绑定证据需求

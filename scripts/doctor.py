@@ -199,7 +199,7 @@ def check_python_version() -> DoctorResult:
 
 def check_python_packages() -> DoctorResult:
     """检查后端运行所需的关键第三方包是否已安装。"""
-    # 键为展示名，值为实际导入名（如 PyMuPDF 的导入名是 fitz）。
+    # 键为展示名，值为实际导入名。
     packages = {
         "fastapi": "fastapi",
         "uvicorn": "uvicorn",
@@ -209,7 +209,7 @@ def check_python_packages() -> DoctorResult:
         "langgraph": "langgraph",
         "pymilvus": "pymilvus",
         "openai": "openai",
-        "fitz(PyMuPDF)": "fitz",
+        "PyMuPDF": "pymupdf",
         "docling": "docling",
     }
     missing = [label for label, module in packages.items() if not _importable(module)]
@@ -313,6 +313,7 @@ def check_local_directories() -> DoctorResult:
         BACKEND_ROOT / "02-embedded-docs",
         BACKEND_ROOT / "03-vector-store",
         BACKEND_ROOT / "03-docling-assets",
+        BACKEND_ROOT / "03-fulltext-cache",
         BACKEND_ROOT / "05-generation-results",
         BACKEND_ROOT / "06-daily-arxiv-paper",
         BACKEND_ROOT / "06-database",
@@ -533,7 +534,8 @@ def check_fastapi_lazy_app() -> DoctorResult:
 def check_pdf_dependencies() -> DoctorResult:
     """检查 PDF 下载解析链路依赖的三个库；只影响真实运行，默认离线测试使用替身。"""
     modules = {
-        "PyMuPDF(fitz)": "fitz",
+        "PyMuPDF": "pymupdf",
+        "pymupdf4llm": "pymupdf4llm",
         "docling": "docling",
         "pypdf": "pypdf",
     }

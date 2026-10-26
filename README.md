@@ -11,9 +11,9 @@ An engineering-oriented research agent for academic paper discovery, evidence-gr
 
 默认使用 JWT 账号登录，已实现角色权限、用户日配额、会话撤销、用户审计，以及本人会话、偏好和画像的访问隔离；论文与索引仍共享。启动前需配置独立签名密钥并创建初始管理员，公网继续使用 HTTPS、实际前端 Origin 和持久化 Redis。完整步骤与边界见 [安全与访问控制](docs/operations/security.md)。签名密钥不发给浏览器，也不能写入任何 `VITE_` 变量；仅显式 `AUTH_MODE=api_key` 时启用受信任团队的共享密钥兼容模式。
 
-新环境使用 [安全初始化脚本](scripts/init_security.py) 生成独立凭据：`--profile development` 写开发 `.env`，`--profile production` 写 `.env.production`。生产模板采用 `arxiv.001769.xyz`，域名解析、HTTPS 证书和存储启动步骤见 [CI/CD 部署手册](docs/operations/cicd-deployment.md)。已有配置不会被覆盖。
+新环境使用 [安全初始化脚本](scripts/init_security.py) 生成独立凭据：`--profile development` 写开发 `.env`，`--profile production` 写 `.env.production`，生产域名用 `--domain` 指定。域名解析、HTTPS 证书和存储启动步骤见 [CI/CD 部署手册](docs/operations/cicd-deployment.md)。已有配置不会被覆盖。
 
-Debian 12 全新服务器的安装、发布目录、GitHub Secrets 和回退步骤见 [CI/CD 部署手册](docs/operations/cicd-deployment.md)。main 推送的自动部署默认关闭；启用前须完成服务器初始化与 Actions 验收。
+Debian 12 全新服务器的安装、发布目录、GitHub Secrets 和回退步骤见 [CI/CD 部署手册](docs/operations/cicd-deployment.md)。main 推送后是否自动部署由仓库变量 `DEPLOY_ENABLED` 控制，未设为 `true` 时只跑质量门与密钥扫描；启用前须完成服务器初始化与 Actions 验收。
 
 ---
 
@@ -83,12 +83,14 @@ flowchart TD
 
 ### 2. 证据驱动的论文级 RAG
 
-- 使用 Docling 解析论文版面与结构（PyMuPDF 只用于标注 PDF 和裁剪图表）。
+- 提供两种问答模式：详细模式走检索 + 逐句证据校验，需要先建索引；快速模式不建索引，整篇论文直接交给模型作答。
+- 详细模式使用 Docling 解析论文版面与结构（PyMuPDF 用于标注 PDF 和裁剪图表）；快速模式用 pymupdf4llm 提取全文与图表截图。
 - 构建 chunk、Embedding、稀疏索引和论文级检索资产。
 - 组合向量检索、BM25、关键词、结构化表格等召回路径。
 - 通过候选融合、rerank、上下文扩展和预算控制构造最终上下文。
 - 对回答使用的证据进行校验，并保留检索与生成 trace。
 - 支持论文级连续问答、会话记录和索引构建状态管理。
+- 论文发现同时支持 arXiv 在线检索和本地 OAI 元数据镜像检索。
 
 ### 3. 研究记忆与个性化推荐
 
@@ -99,10 +101,10 @@ flowchart TD
 
 ### 4. 全栈交互与可观测性
 
-- Vue 3 前端覆盖论文检索、详情、问答、推荐、研究画像和 Agent 搜索。
+- Vue 3 前端覆盖论文检索、详情与问答、推荐、研究画像、已标记论文、Agent 搜索和账号配额；管理员另有用户管理、索引管理与检索调试页面。
 - FastAPI 后端统一承载业务 API、SSE 流式事件和错误结构。
 - debug/trace 记录 Planner 路径、fallback、工具执行和恢复过程。
-- 调试路由默认关闭，避免普通运行环境暴露内部论文资产和诊断数据。
+- 索引诊断、trace 下载、解析产物查看和检索调试只对管理员开放，避免向普通用户暴露内部论文资产和他人的问答记录。
 
 ---
 
@@ -139,6 +141,8 @@ Replanner 只负责串联失败分类、候选生成、动作选择、安全检�
 
 这种分层让检索质量、上下文裁剪和回答证据可以分别测试和调试，也为后续建立 RAG 效果评测提供可观测基础。
 
+需要快速了解一篇论文时，可以切到快速模式：不建索引，把整篇论文（含图表截图）一次交给模型直接作答，回答带原文引用但不逐句核对。
+
 ---
 
 ## 核心代码导航
@@ -150,7 +154,7 @@ Replanner 只负责串联失败分类、候选生成、动作选择、安全检�
 | 工具执行与人工确认 | [plan_executor.py](backend/agents/arxiv_search_agent/plan_executor.py)、[tool_registry.py](backend/agents/arxiv_search_agent/tool_registry.py) |
 | 失败观察与重规划 | [observer.py](backend/agents/arxiv_search_agent/observer.py)、[replanner.py](backend/agents/arxiv_search_agent/replanner.py)、[recovery_policy.py](backend/agents/arxiv_search_agent/recovery_policy.py) |
 | 恢复安全与 checkpoint | [recovery_safety.py](backend/agents/arxiv_search_agent/recovery_safety.py)、[runtime_checkpoint.py](backend/agents/arxiv_search_agent/runtime_checkpoint.py) |
-| 论文问答 | [paper_qa_service.py](backend/services/paper_qa/paper_qa_service.py)、[paper_evidence_research/module.py](backend/services/paper_evidence_research/module.py) |
+| 论文问答 | [paper_qa_service.py](backend/services/paper_qa/paper_qa_service.py)、[paper_evidence_research/module.py](backend/services/paper_evidence_research/module.py)、[fast_answer_service.py](backend/services/paper_fast_qa/fast_answer_service.py) |
 | 混合检索 | [retrieval_pipeline.py](backend/services/retrieval/retrieval_pipeline.py)、[result_fusion_service.py](backend/services/retrieval/result_fusion_service.py)、[rerank_service.py](backend/services/retrieval/rerank_service.py) |
 | 研究记忆 | [memory_service.py](backend/services/memory/memory_service.py)、[profile_aggregator.py](backend/services/memory/profile_aggregator.py)、[profile_reviewer.py](backend/services/memory/profile_reviewer.py) |
 | 配置入口 | [config.py](backend/utils/config.py)、[.env.example](.env.example) |
@@ -170,6 +174,7 @@ backend/
   02-sparse-indexes/       # 稀疏索引
   03-vector-store/         # 向量存储相关资产
   03-docling-assets/       # Docling 解析资产
+  03-fulltext-cache/       # 快速问答的全文解析缓存
   05-generation-results/   # 模型生成结果
   06-evaluation-result/    # 评测产物
   06-daily-arxiv-paper/    # arXiv 日常同步产物
@@ -184,10 +189,10 @@ backend/
 | 层级 | 主要组件 |
 | --- | --- |
 | Agent Runtime | LangGraph、Pydantic、结构化 Tool Registry |
-| 后端 | Python、FastAPI、Uvicorn |
-| RAG 与文档解析 | Docling、PyMuPDF、Embedding、BM25、Rerank |
-| 存储 | SQLite、Milvus、本地文件资产 |
-| 前端 | Vue 3、TypeScript、Vite、Pinia、Element Plus |
+| 后端 | Python、FastAPI、Uvicorn、Gunicorn |
+| RAG 与文档解析 | Docling、PyMuPDF、pymupdf4llm、Embedding、BM25、Rerank |
+| 存储 | SQLite、Milvus（本地 Standalone / 生产 Milvus Lite）、Redis（访问控制状态）、本地文件资产 |
+| 前端 | Vue 3、TypeScript、Vite、Pinia、Element Plus、vue-element-plus-x |
 | 工程质量 | pytest、Node.js 测试脚本、GitHub Actions、Gitleaks |
 
 ---
@@ -197,20 +202,26 @@ backend/
 ~~~text
 backend/
   agents/arxiv_search_agent/  # Agent 规划、执行、观察、恢复与响应组装
+  auth/  middleware/           # 账号、角色权限、配额与访问控制
+  core/                        # 统一错误码等公共契约
   routers/                     # FastAPI 路由
   services/                    # 检索、QA、记忆、推荐、存储等业务模块
   tools/                       # 后端工具与工具注册
-  tests/                       # 单元、集成与启动烟测
+  tests/                       # 单元、集成、API 与启动烟测
   utils/                       # 配置、日志与通用工具
+  07-arxiv-tools/              # OAI 同步、本地搜索索引与向量维护脚本
 
 frontend/
   src/api/                     # API client 与流式请求
-  src/views/                   # 检索、论文、推荐、画像和 Agent 页面
+  src/views/                   # 检索、论文、推荐、画像、Agent、账号与管理页面
+  src/components/              # 问答面板、证据面板等组件
+  src/composables/             # 问答、翻译、用户上下文等组合逻辑
   src/stores/                  # Pinia 状态管理
 
-scripts/                       # doctor、静态检查和统一质量门
-docs/                          # 架构、运行时和质量门说明
-.github/workflows/             # CI 与全历史密钥扫描
+deploy/                        # 发布脚本、systemd 与 nginx 配置
+scripts/                       # doctor、静态检查、安全初始化、账号管理和统一质量门
+docs/                          # 架构、能力模块与运维说明
+.github/workflows/             # 质量门、发布、自动部署与全历史密钥扫描
 ~~~
 
 ---
@@ -219,13 +230,13 @@ docs/                          # 架构、运行时和质量门说明
 
 ### 已验证环境
 
-当前版本主要在 Windows 环境开发和验证。GitHub 质量工作流已配置为 Ubuntu runner 上的 Debian 12 容器（Python 3.11），前端使用 Node.js 22；这让原生 wheel 的构建环境与目标服务器保持一致。
+本地开发在 Windows（Python 3.13）上进行；生产部署和 GitHub 质量工作流使用 Debian 12 / Python 3.11（Ubuntu runner 上的 `python:3.11-bookworm` 容器），前端使用 Node.js 22，原生 wheel 的构建环境与生产服务器保持一致。
 
-- Python 3.10+
-- Node.js 18+
+- Python 3.11+（锁文件按 Debian 12 自带的 3.11.2 生成）
+- Node.js 20.19+ 或 22.12+（`@vitejs/plugin-vue` 6 的要求）
 - npm 9+
 
-Debian 12 / Python 3.11 是当前 CI/CD 的目标环境，完整依赖安装、真实服务与 2GB 容量仍需在首轮发布中验收。macOS 尚未完成兼容性验证。
+macOS 尚未完成兼容性验证。
 
 ### 1. 离线工程验证
 
@@ -253,7 +264,7 @@ python scripts/check_quality.py smoke
 python scripts/check_quality.py
 ~~~
 
-完整入口会依次执行环境体检、后端静态检查、后端测试、后端启动烟测、前端测试和生产构建。
+完整入口会依次执行文档检查、部署脚本测试、环境体检、后端静态检查、后端测试、后端启动烟测、前端测试和生产构建。
 
 ### 2. 完整功能运行
 
@@ -263,7 +274,7 @@ python scripts/check_quality.py
 - 正在运行的 Milvus；
 - 可写的 SQLite 与运行产物目录；
 - arXiv 在线访问能力，或已经同步的本地 OAI 元数据；
-- 需要论文问答时，在本地下载并构建对应论文索引。
+- 需要详细模式的论文问答时，在本地下载并构建对应论文索引；快速模式无需索引。
 
 使用 DashScope 默认模型链路时，先在新环境生成私有开发配置：
 
@@ -315,15 +326,12 @@ python scripts/doctor.py full
 
 ## 工程质量
 
-当前公开迁移基线（<code>28e264f</code>）已完成：
+当前规模（2026-10）：
 
-- 后端测试：<code>734 passed</code>。
-- 后端静态检查：43 个关键模块成功导入。
-- 前端自动化测试：全部通过。
-- 前端生产构建：通过。
-- 后端 lazy 启动烟测：通过。
-- GitHub Actions Quality Gate：通过。
-- Gitleaks 全历史密钥扫描：通过。
+- 后端测试：1630 个用例（单元、集成、API 与启动烟测）。
+- 后端静态检查：43 个关键模块的导入烟测。
+- 前端：13 组 Node.js 测试脚本与 `vue-tsc` 类型检查、生产构建。
+- 每次推送都由 GitHub Actions Quality Gate 与 Gitleaks 全历史密钥扫描把关，最新结果见页首徽章。
 
 CI 与本地使用同一个统一入口：
 
@@ -337,7 +345,7 @@ python scripts/check_quality.py ci
 
 ## 评测状态
 
-当前仓库尚未发布系统性的 Agent/RAG 效果评测结果。后续计划至少覆盖：
+单篇论文研究问答已有评测框架：按人工标注的 golden 集计算要点覆盖、证据支持、拒答、修复增益与成本，每题重复 3 次取中位数，详见 [生成效果评测](docs/capabilities/evaluation.md)。但仓库尚未发布系统性的 Agent/RAG 效果评测结果，后续计划至少覆盖：
 
 - Agent 任务成功率、计划合法率、工具调用成功率和 fallback 率；
 - 重规划触发率、恢复成功率和人工确认后的继续执行成功率；
@@ -352,7 +360,8 @@ python scripts/check_quality.py ci
 
 - 默认 Planner 为 <code>llm_preferred</code>，LLM 计划必须经过本地校验，失败时回退到规则型 Planner。
 - 完整链路依赖外部模型服务、Milvus、论文数据和 arXiv 网络条件。
-- 当前只正式验证 Windows；Linux 和 macOS 支持仍待补充。
+- 本地开发在 Windows，生产运行在 Debian 12；macOS 尚未验证。
+- 快速问答依赖的 pymupdf-layout 为 PolyForm Noncommercial 许可，本项目不商用；如需商用须先替换。
 - 仓库不包含论文、索引、数据库、模型输出和用户运行数据。
 - 当前没有承诺持续可用的在线演示服务。
 - 项目用于研究与工程验证，尚未达到生产级 SLA。
@@ -362,17 +371,39 @@ python scripts/check_quality.py ci
 
 ## 界面概览
 
-当前截图展示论文管理、检索、推荐和研究画像入口。后续将补充能够体现计划生成、工具执行、人工确认和恢复过程的 Agent 完整执行截图。
+截图取自本地开发环境（2026-10）。
 
-![项目界面](images/RAG-fontend.png)
+**首页**：论文库规模、标记数量、OAI 同步状态和常用入口。
+
+![首页](images/home.png)
+
+**论文搜索**：检索本地 OAI 镜像库，支持字段前缀与布尔语法，页面会标明与远程 arXiv API 的能力差异。
+
+![论文搜索](images/paper-search.png)
+
+**论文详情**：右侧显示快速模式的全文读取状态和详细模式的索引状态，问答区可在快速/详细两种模式间切换。
+
+![论文详情与问答模式切换](images/paper-detail.png)
+
+**详细模式问答**：回答中的引用角标可定位原文；未找到证据支持的句子会被移除并单独列出；右侧「研究过程」展示每轮检索、起草和主张校验的决策。
+
+![详细模式问答与研究过程](images/paper-qa.png)
+
+**研究画像**：根据阅读与标记行为生成关注/排除主题，点击主题可查看得分和来源论文。
+
+![研究画像](images/research-profile.png)
+
+**Agent 搜索**：用自然语言描述需求，Agent 结合研究画像规划检索并返回论文列表，历史会话可随时恢复。
+
+![Agent 搜索](images/agent-search.png)
 
 ---
 
 ## Roadmap
 
-1. **建立 Agent/RAG 评测体系**：补充固定任务集、检索指标、回答忠实度、恢复收益、延迟与成本报告。
+1. **完善 Agent/RAG 评测**：在已有单篇问答评测框架基础上扩充 golden 集并发布结果，补充 Agent 任务集、检索指标与快速/详细模式的对比。
 2. **完善 LLM Planner 实验**：对比 <code>llm_preferred</code>、<code>rule_only</code> 和混合回退策略，评估计划合法率与实际任务成功率。
-3. **提高复现与演示能力**：补充跨平台依赖、容器化运行方案、演示数据和 Agent 执行截图或视频。
+3. **提高复现与演示能力**：补充跨平台依赖、容器化运行方案、演示数据，以及体现计划生成、工具执行、人工确认和恢复过程的 Agent 执行录屏。
 
 ---
 

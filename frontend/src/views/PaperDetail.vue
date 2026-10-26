@@ -28,6 +28,9 @@ import {
   getPaperQaDiagnostic,
   getPaperQaStatus,
   getPaperRetrievalTraceDownloadUrl,
+  getFastQaFulltextStatus,
+  prepareFastQaFulltext,
+  type FastQaFulltextStatus,
   type QaDiagnosticResult,
   type QaIndexJobResult,
   type QaStatusResult
@@ -49,6 +52,8 @@ const qaJobPolling = ref(false)
 // 连续轮询失败次数，用于退避和提示“正在重试”。
 const qaJobPollFailures = ref(0)
 const qaStatus = ref<QaStatusResult | null>(null)
+// 快速模式的全文准备状态：进详情页就触发预解析，读取中定时刷新。
+const fulltextStatus = ref<FastQaFulltextStatus | null>(null)
 const qaDiagnostic = ref<QaDiagnosticResult | null>(null)
 // 诊断要列 Milvus 集合并抽样 chunk，冷启动时要几秒；只在管理员展开诊断面板时才请求。
 const qaDiagnosticOpen = ref(false)
@@ -70,6 +75,8 @@ const {
   currentSession,
   availableSessions,
   retrievalOptions,
+  effectiveAnswerMode,
+  setAnswerMode,
   submitQuestion,
   resubmitTurn,
   cancelCurrentStream,
@@ -82,6 +89,7 @@ const {
   clearCurrentSession
 } = usePaperRagChat({
   paperId,
+  canUseResearch: () => Boolean(qaStatus.value?.has_index),
   onEnterQaMode: () => {
     qaMode.value = true
   }
@@ -98,6 +106,21 @@ const hasActiveQaJob = computed(() => ['pending', 'running'].includes(String(qaI
 // 任务块只展示构建过程：进行中显示进度，失败显示原因。索引是否可用只看索引状态，
 // 成功的任务只是历史记录（索引之后可能已被删除或替换），不再展示。
 const showQaJobStatus = computed(() => hasActiveQaJob.value || qaIndexJob.value?.status === 'failed')
+const isFastMode = computed(() => effectiveAnswerMode.value === 'fast')
+const fulltextStatusText = computed(() => {
+  const status = fulltextStatus.value
+  if (!status) return ''
+  if (status.status === 'ready') {
+    return `全文已读取：${status.page_count || 0} 页，${status.image_count || 0} 张图表`
+  }
+  if (status.status === 'queued') return '全文排队读取中，提问时会优先处理'
+  if (status.status === 'parsing') return '正在读取论文全文…'
+  if (status.status === 'busy') return '读取队列已满，提问时会优先读取全文'
+  if (status.status === 'failed') {
+    return status.reason === 'empty' ? 'PDF 没有可提取的文字，快速模式不可用' : '全文读取失败，稍后提问会重试'
+  }
+  return ''
+})
 const chatTurns = computed(() => qaResults.value)
 const ragChatMessages = computed(() => chatTurns.value.flatMap(qaTurnToRagMessages))
 // Milvus 存的是 RetrievalIndex 向量（非原始 chunk），核对基准是后端按入库规则算出的预期向量数。
@@ -148,6 +171,7 @@ const currentPaperActions = computed(() => store.currentPaper?.paperActions || {
 const preferredAnswerStyle = computed(() => store.researchProfile?.preferred_answer_style || '')
 
 let qaJobPollTimer: number | null = null
+let fulltextPollTimer: number | null = null
 
 function formatDate(dateStr: string) {
   return new Date(dateStr).toLocaleDateString('zh-CN', {
@@ -290,8 +314,46 @@ async function fetchQaStatus() {
 }
 
 async function handleRefreshQaState() {
-  await fetchQaStatus()
+  await Promise.all([fetchQaStatus(), prepareFulltext()])
   await resumeLatestQaJobPolling()
+}
+
+function stopFulltextPolling() {
+  if (fulltextPollTimer) {
+    clearTimeout(fulltextPollTimer)
+    fulltextPollTimer = null
+  }
+}
+
+function applyFulltextStatus(status: FastQaFulltextStatus) {
+  fulltextStatus.value = status
+  stopFulltextPolling()
+  if (status.status !== 'queued' && status.status !== 'parsing') return
+  const polledPaperId = paperId.value
+  fulltextPollTimer = window.setTimeout(async () => {
+    try {
+      const next = await getFastQaFulltextStatus(polledPaperId)
+      // 轮询返回前用户可能已切到别的论文，旧结果不能覆盖新论文的状态。
+      if (polledPaperId === paperId.value) applyFulltextStatus(next)
+    } catch (error) {
+      console.warn('Failed to poll fulltext status:', error)
+    }
+  }, 2500)
+}
+
+async function prepareFulltext() {
+  if (!paperId.value) return
+  try {
+    applyFulltextStatus(await prepareFastQaFulltext(paperId.value))
+  } catch (error) {
+    // 预解析只是提速；失败时提问仍会触发读取，这里不打扰用户。
+    console.warn('Failed to prepare fulltext:', error)
+    fulltextStatus.value = null
+  }
+}
+
+function handleAnswerModeChange(mode: string | number | boolean | undefined) {
+  setAnswerMode(mode === 'research' ? 'research' : 'fast')
 }
 
 function clearQaJobPollTimer() {
@@ -410,28 +472,25 @@ async function handleCreateIndex() {
   }
 }
 
-async function handleAskPaper() {
-  if (!hasQaIndex.value) {
-    if (!canResearch.value) {
-      ElMessage.info('这篇论文还没有问答索引，请联系研究者或管理员创建。')
-      return
-    }
-    try {
-      await ElMessageBox.confirm(
-        '这篇论文还没有建立问答索引，需要先下载 PDF 并创建索引。这个过程可能需要几分钟，是否继续？',
-        '确认创建索引',
-        {
-          confirmButtonText: '继续',
-          cancelButtonText: '取消',
-          type: 'warning'
-        }
-      )
-      await handleCreateIndex()
-    } catch {
-      return
-    }
+async function handleRequestIndex() {
+  try {
+    await ElMessageBox.confirm(
+      '详细模式需要先下载 PDF 并建立问答索引，这个过程可能需要几分钟，是否继续？',
+      '确认创建索引',
+      {
+        confirmButtonText: '继续',
+        cancelButtonText: '取消',
+        type: 'warning'
+      }
+    )
+  } catch {
+    return
   }
+  await handleCreateIndex()
+}
 
+// 快速模式不依赖索引，任何论文都可以直接进入问答；详细模式的索引在侧栏单独创建。
+async function handleAskPaper() {
   qaMode.value = true
   if (!currentSession.value && !sessionLoading.value) {
     await loadRecentSession()
@@ -475,6 +534,11 @@ function getTurnStatusHint(item: { response?: any }) {
   return ''
 }
 
+// 快速模式的回答没有经过逐句证据核对，在回答下方明确标出。
+function isFastTurn(item: { response?: any }) {
+  return item.response?.mode === 'fast'
+}
+
 function canResubmitTurn(item: { response?: any }) {
   // 面板消息同时兼容 Agent/QA 响应，只有 QA turn 的终态非 completed 时才展示重试入口。
   return Boolean(item.response && item.response.status !== 'completed')
@@ -508,6 +572,7 @@ async function loadPageData() {
       store.fetchPaperById(paperId.value),
       store.fetchPaperActions(),
       fetchQaStatus(),
+      prepareFulltext(),
       resumeLatestQaJobPolling(),
       loadRecentSession()
     ])
@@ -528,12 +593,15 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   cancelCurrentStream('cleanup')
   stopQaJobPolling()
+  stopFulltextPolling()
   if (typeof window === 'undefined') return
   window.removeEventListener('resize', syncViewport)
 })
 
 watch(paperId, async () => {
   stopQaJobPolling()
+  stopFulltextPolling()
+  fulltextStatus.value = null
   // 并发加载前先清掉上一篇的对话和诊断，避免新论文的请求返回前短暂显示旧数据。
   resetChat()
   qaDiagnostic.value = null
@@ -602,10 +670,9 @@ watch(paperId, async () => {
               type="primary"
               class="ask-button"
               :icon="ChatDotRound"
-              :loading="creatingIndex"
               @click="handleAskPaper"
             >
-              {{ creatingIndex ? '提交索引任务中...' : (hasActiveQaJob ? `索引构建中 · ${qaJobStatusText}` : '开始问答') }}
+              开始问答
             </el-button>
             <a :href="store.currentPaper.absUrl" target="_blank" rel="noopener" class="action-link">
               <el-button size="large" class="action-button" :icon="Link">查看 arXiv 原文</el-button>
@@ -628,12 +695,25 @@ watch(paperId, async () => {
             <div v-else-if="qaJobPollFailures > 0" class="muted">暂时无法获取最新进度，正在重试…</div>
           </div>
 
+          <div v-if="fulltextStatusText" class="status-note">
+            <el-icon><Document /></el-icon>
+            <span>{{ fulltextStatusText }}</span>
+          </div>
+
           <div v-if="qaStatus" class="status-note">
             <el-icon><Compass /></el-icon>
             <span>
-              {{ qaStatus.has_index ? `索引已完成，${qaStatus.chunk_count || 0} 个片段可供检索` : canResearch ? '先创建索引' : '请联系研究者或管理员创建问答索引' }}
+              {{ qaStatus.has_index ? `详细模式索引已完成，${qaStatus.chunk_count || 0} 个片段可供检索` : canResearch ? '详细模式需要先建立问答索引' : '详细模式需要问答索引，请联系研究者或管理员创建' }}
             </span>
           </div>
+          <el-button
+            v-if="qaStatus && !qaStatus.has_index && canResearch && !hasActiveQaJob"
+            class="action-button"
+            :loading="creatingIndex"
+            @click="handleRequestIndex"
+          >
+            {{ creatingIndex ? '提交索引任务中...' : '建立索引（详细模式）' }}
+          </el-button>
 
           <div class="aside-block">
             <div class="aside-label"><span>我的标记</span></div>
@@ -661,7 +741,21 @@ watch(paperId, async () => {
           <div class="qa-panel-header">
             <div>
               <h2 class="section-title">论文问答</h2>
-              <p class="section-desc">先检索论文片段，再交给大模型生成带引用来源的答案</p>
+              <p class="section-desc">
+                {{ isFastMode ? '整篇论文交给大模型直接作答，速度快，引用不逐句核对' : '多轮检索论文片段，逐句核对证据后再给出答案' }}
+              </p>
+              <el-radio-group
+                class="answer-mode-switch"
+                size="small"
+                :model-value="effectiveAnswerMode"
+                :disabled="qaLoading"
+                @change="handleAnswerModeChange"
+              >
+                <el-radio-button value="fast">快速</el-radio-button>
+                <el-tooltip :disabled="hasQaIndex" content="详细模式需要先建立问答索引" placement="top">
+                  <el-radio-button value="research" :disabled="!hasQaIndex">详细</el-radio-button>
+                </el-tooltip>
+              </el-radio-group>
             </div>
 
             <div class="panel-actions">
@@ -695,11 +789,11 @@ watch(paperId, async () => {
             :loading="qaLoading || sessionLoading"
             :quick-prompts="quickPrompts"
             title="关于这篇论文，你想了解什么？"
-            :description="`围绕《${store.currentPaper.title}》提问，系统会先召回相关片段，再生成答案。`"
+            :description="isFastMode ? `围绕《${store.currentPaper.title}》提问，系统会读取全文后直接回答。` : `围绕《${store.currentPaper.title}》提问，系统会先召回相关片段，再生成答案。`"
             prompt-title="快捷问题"
             assistant-label="Qwen"
             sender-placeholder="输入你想问论文的问题，Enter 发送，Shift+Enter 换行"
-            sender-tip="回答基于检索到的论文片段生成，点击角标可定位原文证据"
+            :sender-tip="isFastMode ? '回答基于论文全文生成，引用未逐句核对，点击角标可查看原文' : '回答基于检索到的论文片段生成，点击角标可定位原文证据'"
             :can-stop="qaLoading"
             @submit-question="submitQuestion"
             @select-prompt="applyPrompt"
@@ -725,6 +819,7 @@ watch(paperId, async () => {
                 class="assistant-actions"
               >
                 <div class="assistant-badges">
+                  <span v-if="isFastTurn(item)" class="chip chip--warning">快速模式 · 未逐句核对</span>
                   <span class="chip">{{ item.sources?.length || 0 }} 条来源</span>
                   <span v-if="item.retrievalDebug" class="chip chip--warning">含调试信息</span>
                 </div>
@@ -1203,6 +1298,10 @@ watch(paperId, async () => {
   align-items: flex-start;
   gap: 16px;
   margin-bottom: 12px;
+}
+
+.answer-mode-switch {
+  margin-top: 10px;
 }
 
 .panel-actions {

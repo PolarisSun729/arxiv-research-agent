@@ -1,4 +1,4 @@
-import type { RetrievalDebug } from '@/api/papers'
+import type { QaMode, RetrievalDebug } from '@/api/papers'
 import type { AgentChatMessage } from '@/types/agentChat'
 
 export type QaTurnStatus =
@@ -51,6 +51,10 @@ export interface QaTurnForRagChat {
   questionContextualization?: Record<string, any> | null
   citedSourceIds?: string[]
   citationWarning?: string | null
+  // 这一轮走的问答模式；历史记录按 retrieval_debug.engine 还原。
+  mode?: QaMode
+  // 生成前的等待说明（如快速模式正在读取全文），缺省时显示通用的“正在生成回复”。
+  progressText?: string | null
 }
 
 export interface RagChatMessage extends AgentChatMessage<QaTurnForRagChat> {
@@ -59,6 +63,7 @@ export interface RagChatMessage extends AgentChatMessage<QaTurnForRagChat> {
   retrievalDebug: RetrievalDebug | null
   citedSourceIds: string[]
   citationWarning: string | null
+  loadingText?: string
 }
 
 // Keep the transformation centralized so the future UI swap can reuse the same
@@ -91,7 +96,8 @@ export function qaTurnToRagMessages(turn: QaTurnForRagChat): RagChatMessage[] {
     sources: turn.sources,
     retrievalDebug: turn.retrievalDebug ?? null,
     citedSourceIds: turn.citedSourceIds || [],
-    citationWarning: turn.citationWarning || null
+    citationWarning: turn.citationWarning || null,
+    loadingText: turn.progressText || undefined
   }
 
   return [userMessage, assistantMessage]

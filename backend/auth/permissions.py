@@ -72,6 +72,8 @@ _register(ALL_ROLES, None, [
     ("GET", "/api/paper/{arxiv_id}/chat-sessions/{session_id}/messages"),
     ("POST", "/api/paper/{arxiv_id}/chat-sessions/{session_id}/clear"),
     ("DELETE", "/api/paper/{arxiv_id}/chat-sessions/{session_id}"),
+    # 快速问答的全文状态与预解析：只下载 PDF、本地解析，不调用模型；预解析排队数有上限。
+    ("GET", "/api/paper/{arxiv_id}/fast-qa/status"), ("POST", "/api/paper/{arxiv_id}/fast-qa/prepare"),
     # 本地目录读取不产生外部成本；论文详情只在回源 arXiv 时由路由内部扣减 papers 配额。
     ("GET", "/api/papers"), ("GET", "/api/papers/category/{category}"), ("GET", "/api/paper/{arxiv_id}"),
     ("GET", "/api/user/labeled-papers/{user_id}"),

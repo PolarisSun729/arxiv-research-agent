@@ -156,6 +156,54 @@ function stepTone(kind?: string) {
 // 开头连续的 chunk 号 / 类型 / 页码 / 分数是定位信息，其余是预览。
 const CONTEXT_HEAD_PART = /^(chunk \S+|[a-z_]+|p[\d-]+|\d+(\.\d+)?)$/
 
+// 快速模式不检索：整篇论文一次交给模型，过程只有"读取全文"和"生成"两段。
+const isFast = computed(() => props.retrievalDebug?.engine === 'fast_fulltext')
+
+function formatMs(value?: number | null) {
+  if (typeof value !== 'number') return '-'
+  return value >= 1000 ? `${(value / 1000).toFixed(1)} 秒` : `${Math.round(value)} 毫秒`
+}
+
+const fastSteps = computed(() => {
+  const debug = props.retrievalDebug
+  const fulltext = debug?.fulltext || {}
+  const input = debug?.input || {}
+  const usage = debug?.usage || {}
+  const cachedTokens = usage.input_tokens_details?.cached_tokens
+  const invalidIds = debug?.invalid_citation_ids || []
+  return [
+    {
+      key: 'fulltext',
+      title: '读取全文',
+      content: `${fulltext.page_count ?? '-'} 页 · ${fulltext.char_count ?? '-'} 字符 · ${fulltext.image_count ?? 0} 张图表` +
+        (typeof fulltext.parse_seconds === 'number' ? ` · 解析 ${fulltext.parse_seconds.toFixed(1)} 秒` : '')
+    },
+    { key: 'wait', title: '等待全文', content: formatMs(debug?.wait_fulltext_ms) },
+    {
+      key: 'input',
+      title: '模型输入',
+      content: `${input.image_count ?? 0} 张图片` +
+        (typeof input.request_bytes === 'number' ? ` · 请求 ${(input.request_bytes / 1024 / 1024).toFixed(1)} MB` : '') +
+        (input.images_downscaled ? ' · 图片已缩小' : '') +
+        ` · 带最近 ${debug?.history_turn_count ?? 0} 轮对话`
+    },
+    {
+      key: 'tokens',
+      title: 'Token',
+      content: typeof usage.input_tokens === 'number'
+        ? `输入 ${usage.input_tokens}（缓存命中 ${cachedTokens ?? 0}）· 输出 ${usage.output_tokens ?? '-'}`
+        : '无用量数据'
+    },
+    { key: 'first-token', title: '首字耗时', content: formatMs(debug?.first_token_ms) },
+    { key: 'generation', title: '生成耗时', content: formatMs(debug?.generation_ms) },
+    {
+      key: 'citations',
+      title: '引用整理',
+      content: invalidIds.length ? `去掉 ${invalidIds.length} 个不存在的引用：${invalidIds.join(', ')}` : '引用均指向论文原文块'
+    }
+  ]
+})
+
 function parseContextLines(content: string) {
   return content
     .split('\n')
@@ -269,6 +317,19 @@ function parseContextLines(content: string) {
       </div>
       <div v-else class="chain-empty">本次研究没有执行检索</div>
     </section>
+  </div>
+
+  <div v-else-if="isFast" class="chain">
+    <div class="chain-question">
+      <span class="chain-label">原始问题</span>
+      <p>{{ question || '无' }}</p>
+    </div>
+    <dl class="chain-stages chain-stages--flat">
+      <template v-for="step in fastSteps" :key="step.key">
+        <dt>{{ step.title }}</dt>
+        <dd>{{ step.content }}</dd>
+      </template>
+    </dl>
   </div>
 
   <div v-else class="chain">

@@ -39,6 +39,8 @@ class ErrorCode:
     PAPER_NOT_FOUND = "paper_not_found"
     QA_INDEX_NOT_FOUND = "qa_index_not_found"
     QA_INDEX_BUILD_FAILED = "qa_index_build_failed"
+    PAPER_FULLTEXT_UNAVAILABLE = "paper_fulltext_unavailable"
+    PAPER_TOO_LONG_FOR_FAST_QA = "paper_too_long_for_fast_qa"
     VECTOR_STORE_ERROR = "vector_store_error"
     LLM_GENERATION_FAILED = "llm_generation_failed"
     RESUME_CHECKPOINT_NOT_FOUND = "resume_checkpoint_not_found"
@@ -75,6 +77,8 @@ ERROR_MESSAGES: Dict[str, str] = {
     ErrorCode.PAPER_NOT_FOUND: "未找到对应论文，请确认论文 ID 是否正确。",
     ErrorCode.QA_INDEX_NOT_FOUND: "这篇论文还没有 QA 索引，请先构建索引。",
     ErrorCode.QA_INDEX_BUILD_FAILED: "论文 QA 索引构建失败，可以稍后重新构建。",
+    ErrorCode.PAPER_FULLTEXT_UNAVAILABLE: "论文全文读取失败，请稍后重试或改用详细模式。",
+    ErrorCode.PAPER_TOO_LONG_FOR_FAST_QA: "这篇论文超出了快速模式的模型输入上限，请改用详细模式。",
     ErrorCode.VECTOR_STORE_ERROR: "检索服务暂时不可用，请稍后重试。",
     ErrorCode.LLM_GENERATION_FAILED: "答案生成失败，请稍后重试。",
     ErrorCode.RESUME_CHECKPOINT_NOT_FOUND: "原执行现场已失效，请重新发起请求。",
@@ -111,6 +115,8 @@ ERROR_HTTP_STATUS: Dict[str, int] = {
     ErrorCode.PAPER_NOT_FOUND: 404,
     ErrorCode.QA_INDEX_NOT_FOUND: 404,
     ErrorCode.QA_INDEX_BUILD_FAILED: 500,
+    ErrorCode.PAPER_FULLTEXT_UNAVAILABLE: 503,
+    ErrorCode.PAPER_TOO_LONG_FOR_FAST_QA: 422,
     ErrorCode.VECTOR_STORE_ERROR: 503,
     ErrorCode.LLM_GENERATION_FAILED: 502,
     ErrorCode.RESUME_CHECKPOINT_NOT_FOUND: 404,
@@ -141,6 +147,8 @@ RECOVERABLE_DEFAULTS: Dict[str, bool] = {
     ErrorCode.PAPER_NOT_FOUND: False,
     ErrorCode.QA_INDEX_NOT_FOUND: True,
     ErrorCode.QA_INDEX_BUILD_FAILED: True,
+    ErrorCode.PAPER_FULLTEXT_UNAVAILABLE: True,
+    ErrorCode.PAPER_TOO_LONG_FOR_FAST_QA: False,
     ErrorCode.VECTOR_STORE_ERROR: True,
     ErrorCode.LLM_GENERATION_FAILED: True,
     ErrorCode.RESUME_CHECKPOINT_NOT_FOUND: False,

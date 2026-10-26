@@ -35,16 +35,16 @@ QWEN_TASK_MODEL_ROLES = dict(GENERATION_CONFIG.get("task_model_roles", {}))
 # DashScope Responses API 会在入站阶段按请求体字节数拒绝超大请求；这里用软限制预留
 # JSON、模型名和 extra_body 的余量，避免图片 base64 后把最终 QA 请求撑爆。
 QWEN_RESPONSES_REQUEST_BODY_LIMIT_BYTES = int(
-    GENERATION_CONFIG.get("qwen_responses_request_body_limit_bytes") or 6_291_456
+    GENERATION_CONFIG.get("qwen_responses_request_body_limit_bytes") or 16 * 1024 * 1024
 )
 QWEN_RESPONSES_REQUEST_BODY_SOFT_LIMIT_BYTES = int(
-    GENERATION_CONFIG.get("qwen_responses_request_body_soft_limit_bytes") or 5_500_000
+    GENERATION_CONFIG.get("qwen_responses_request_body_soft_limit_bytes") or 15 * 1024 * 1024
 )
 QWEN_RESPONSES_IMAGE_TARGET_BYTES = int(
     GENERATION_CONFIG.get("qwen_responses_image_target_bytes") or 1_500_000
 )
 QWEN_RESPONSES_MAX_IMAGE_COUNT = int(
-    GENERATION_CONFIG.get("qwen_responses_max_image_count") or 2
+    GENERATION_CONFIG.get("qwen_responses_max_image_count") or 250
 )
 QWEN_RESPONSES_IMAGE_COMPRESSION_STEPS = (
     (1600, 85),
@@ -465,13 +465,16 @@ class GenerationService:
 
     def stream_with_qwen(
         self,
-        prompt: str,
+        prompt: Any,
         model_name: Optional[str] = None,
         task_type: Optional[str] = None,
         enable_thinking: bool = False,
+        usage_sink: Optional[Dict[str, Any]] = None,
     ) -> Iterator[str]:
-        """单轮流式补全，逐段产出模型输出的文本增量。
+        """流式补全，逐段产出模型输出的文本增量。
 
+        prompt 为字符串时按单轮用户输入发送；也可以直接传 Responses API 的输入消息列表（多消息、图文混排）。
+        usage_sink 不为空时，结束后写入模型返回的完整用量（含缓存命中的 token 明细）。
         默认关闭思考：面向用户逐字展示的场景开思考会先产出数千 token 推理，首字要等几十秒。
         """
         if not QWEN_API_KEY:
@@ -497,7 +500,10 @@ class GenerationService:
                 if delta:
                     yield delta
             elif event_type == "response.completed":
-                record_llm_usage(getattr(getattr(event, "response", None), "usage", None))
+                usage = getattr(getattr(event, "response", None), "usage", None)
+                record_llm_usage(usage)
+                if usage_sink is not None and usage is not None:
+                    usage_sink.update(usage.model_dump() if hasattr(usage, "model_dump") else dict(usage))
 
     def rewrite_query_for_retrieval(
         self,
