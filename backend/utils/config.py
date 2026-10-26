@@ -235,7 +235,9 @@ PAPER_FAST_QA_CONFIG: Dict[str, Any] = {
     "parse_concurrency": _env_int("PAPER_FAST_QA_PARSE_CONCURRENCY", 2),
     # 只限制打开详情页触发的预解析排队数；用户提问触发的解析不受限，并排在预解析前面。
     "parse_queue_limit": _env_int("PAPER_FAST_QA_PARSE_QUEUE_LIMIT", 20),
-    "parse_timeout_seconds": _env_int("PAPER_FAST_QA_PARSE_TIMEOUT_SECONDS", 180),
+    # 实测单篇最慢 60 秒（49 页）；两篇同时解析时 CPU 争用使单篇耗时涨到原来的约 6 倍（19 秒 → 2 分钟），
+    # 按最慢单篇乘 6 约 6 分钟，再给比开发机慢的服务器留余量。
+    "parse_timeout_seconds": _env_int("PAPER_FAST_QA_PARSE_TIMEOUT_SECONDS", 600),
     # 提问时全文还没解析好，最多等这么久；超时本轮报错，解析任务继续在后台跑。
     "ask_wait_seconds": _env_int("PAPER_FAST_QA_ASK_WAIT_SECONDS", 120),
     # 解析失败后这段时间内不再重试，避免同一篇坏 PDF 被反复解析占满名额。
