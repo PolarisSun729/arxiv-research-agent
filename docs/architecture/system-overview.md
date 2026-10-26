@@ -75,6 +75,8 @@ Agent 和直接 QA 入口会在不同位置进入系统，但都复用同一组�
 
 [`IndexJobManager`](../../backend/services/paper_qa/index_job_manager.py) 将异步构建任务的提交、占用和状态更新收敛到一个边界。Router 只轮询和序列化 job，不应绕过它直接修改任务状态。
 
+快速问答不使用上述索引：[`PaperFulltextService`](../../backend/services/paper_fast_qa/fulltext_service.py) 把整篇 PDF 解析成全文块和图片，按 PDF 哈希缓存，并用进程内队列限制并发解析。两种模式的区别见 [论文 QA](../capabilities/paper-qa.md)。
+
 ### 用户画像
 
 研究画像存储区分人工层、生成层和 effective 投影。人工偏好与显式编辑不应被自动生成结果覆盖；推荐只能消费由存储层合成的 effective profile。具体约束见 [研究画像与推荐](../capabilities/research-profile-and-recommendations.md)。
@@ -91,7 +93,7 @@ Agent 和直接 QA 入口会在不同位置进入系统，但都复用同一组�
 
 这些配置可以使用仓库外的绝对路径，以支持部署时挂载独立持久卷。`SqliteConnectionProvider`、`ArxivOaiDatabaseService` 和 `PaperQABuildCache` 对直接注入的路径复用相同规则，新增调用方不得自行按当前工作目录解释路径。
 
-加载后的文档、Embedding 结果、检索索引、稀疏索引、Docling 解析资产、向量库本地资产、LLM 生成结果和每日 arXiv 下载产物分别固定在 `backend/01-loaded-docs`、`backend/02-embedded-docs`、`backend/02-retrieval-indexes`、`backend/02-sparse-indexes`、`backend/03-docling-assets`、`backend/03-vector-store`、`backend/05-generation-results` 与 `backend/06-daily-arxiv-paper`。服务代码应通过 `resolve_backend_artifact_path()` 获取这些目录，不能再直接 `os.makedirs("01-loaded-docs")` 或按当前工作目录拼接路径。
+加载后的文档、Embedding 结果、检索索引、稀疏索引、Docling 解析资产、快速问答全文缓存、向量库本地资产、LLM 生成结果和每日 arXiv 下载产物分别固定在 `backend/01-loaded-docs`、`backend/02-embedded-docs`、`backend/02-retrieval-indexes`、`backend/02-sparse-indexes`、`backend/03-docling-assets`、`backend/03-fulltext-cache`、`backend/03-vector-store`、`backend/05-generation-results` 与 `backend/06-daily-arxiv-paper`。服务代码应通过 `resolve_backend_artifact_path()` 获取这些目录，不能再直接 `os.makedirs("01-loaded-docs")` 或按当前工作目录拼接路径。
 
 OAI 增量同步游标位于 `backend/data/arxiv-oai-sync`，发布时随 `backend/data` 链接到服务器共享目录，跨版本保留。本地 Embedding 与 Reranker 模型默认位于仓库根目录的 `00-models`。
 

@@ -139,6 +139,8 @@ Replanner 只负责串联失败分类、候选生成、动作选择、安全检�
 
 这种分层让检索质量、上下文裁剪和回答证据可以分别测试和调试，也为后续建立 RAG 效果评测提供可观测基础。
 
+需要快速了解一篇论文时，可以切到快速模式：不建索引，把整篇论文（含图表截图）一次交给模型直接作答，回答带原文引用但不逐句核对。
+
 ---
 
 ## 核心代码导航
@@ -150,7 +152,7 @@ Replanner 只负责串联失败分类、候选生成、动作选择、安全检�
 | 工具执行与人工确认 | [plan_executor.py](backend/agents/arxiv_search_agent/plan_executor.py)、[tool_registry.py](backend/agents/arxiv_search_agent/tool_registry.py) |
 | 失败观察与重规划 | [observer.py](backend/agents/arxiv_search_agent/observer.py)、[replanner.py](backend/agents/arxiv_search_agent/replanner.py)、[recovery_policy.py](backend/agents/arxiv_search_agent/recovery_policy.py) |
 | 恢复安全与 checkpoint | [recovery_safety.py](backend/agents/arxiv_search_agent/recovery_safety.py)、[runtime_checkpoint.py](backend/agents/arxiv_search_agent/runtime_checkpoint.py) |
-| 论文问答 | [paper_qa_service.py](backend/services/paper_qa/paper_qa_service.py)、[paper_evidence_research/module.py](backend/services/paper_evidence_research/module.py) |
+| 论文问答 | [paper_qa_service.py](backend/services/paper_qa/paper_qa_service.py)、[paper_evidence_research/module.py](backend/services/paper_evidence_research/module.py)、[fast_answer_service.py](backend/services/paper_fast_qa/fast_answer_service.py) |
 | 混合检索 | [retrieval_pipeline.py](backend/services/retrieval/retrieval_pipeline.py)、[result_fusion_service.py](backend/services/retrieval/result_fusion_service.py)、[rerank_service.py](backend/services/retrieval/rerank_service.py) |
 | 研究记忆 | [memory_service.py](backend/services/memory/memory_service.py)、[profile_aggregator.py](backend/services/memory/profile_aggregator.py)、[profile_reviewer.py](backend/services/memory/profile_reviewer.py) |
 | 配置入口 | [config.py](backend/utils/config.py)、[.env.example](.env.example) |
@@ -170,6 +172,7 @@ backend/
   02-sparse-indexes/       # 稀疏索引
   03-vector-store/         # 向量存储相关资产
   03-docling-assets/       # Docling 解析资产
+  03-fulltext-cache/       # 快速问答的全文解析缓存
   05-generation-results/   # 模型生成结果
   06-evaluation-result/    # 评测产物
   06-daily-arxiv-paper/    # arXiv 日常同步产物
@@ -263,7 +266,7 @@ python scripts/check_quality.py
 - 正在运行的 Milvus；
 - 可写的 SQLite 与运行产物目录；
 - arXiv 在线访问能力，或已经同步的本地 OAI 元数据；
-- 需要论文问答时，在本地下载并构建对应论文索引。
+- 需要详细模式的论文问答时，在本地下载并构建对应论文索引；快速模式无需索引。
 
 使用 DashScope 默认模型链路时，先在新环境生成私有开发配置：
 
