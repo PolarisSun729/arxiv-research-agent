@@ -23,7 +23,7 @@
     - 手动补数据：直接运行本脚本，指定任意日期区间
 
 常用示例（在 backend 目录下执行）:
-    # 增量同步：从游标的下一天同步到昨天（外层脚本就是这样调用的）
+    # 增量同步：从游标的下一天同步到 UTC 的昨天（外层脚本就是这样调用的）
     python 07-arxiv-tools/sync_arxiv_oai.py
     # 手动补一段区间：与游标相连时会顺带推进游标，补更早的旧区间则不动游标
     python 07-arxiv-tools/sync_arxiv_oai.py --from 2026-10-01 --until 2026-10-07
@@ -79,7 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
     """定义命令行参数。日期是闭区间，按 OAI 记录的 datestamp（最后修改日期）匹配，而非首次提交日期。"""
     parser = argparse.ArgumentParser(description="Sync arXiv metadata from OAI-PMH into arxiv_oai_papers, day by day.")
     parser.add_argument("--from", dest="from_date", type=_parse_date, help="Start date (YYYY-MM-DD). Default: day after the cursor.")
-    parser.add_argument("--until", dest="until_date", type=_parse_date, help="End date (YYYY-MM-DD). Default: yesterday.")
+    parser.add_argument("--until", dest="until_date", type=_parse_date, help="End date (YYYY-MM-DD). Default: yesterday (UTC).")
     # 相对路径以 backend 目录为基准，与后端读取的位置保持一致。
     parser.add_argument(
         "--state-file",
