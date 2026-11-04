@@ -16,7 +16,7 @@ import logging
 import os
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
@@ -157,6 +157,15 @@ class _Run:
             logger.exception("Failed to write sync metadata file: %s", self.options.meta_file)
 
 
+def utc_today() -> date:
+    """OAI-PMH 的 datestamp 按 UTC 计日，"今天"也必须按 UTC 算，不能用服务器本地日期。
+
+    服务器在 UTC+8 时，本地凌晨对应的 UTC 日期还是前一天；若按本地日期取"昨天"，
+    会去拉一个尚未结束、arXiv 还没发布记录的 UTC 日，拿到 noRecordsMatch 后游标照常推进，那天就被跳过了。
+    """
+    return datetime.now(timezone.utc).date()
+
+
 def _resolve_range(
     options: IncrementalSyncOptions,
     *,
@@ -210,7 +219,7 @@ def run_incremental_sync(
                 return EXIT_FAILED
 
         from_date, until_date, cursor = _resolve_range(
-            options, latest_datestamp=latest_datestamp, today=today or date.today()
+            options, latest_datestamp=latest_datestamp, today=today or utc_today()
         )
         if from_date is None:
             logger.error("No sync cursor and the OAI database is empty; pass --from to choose a start date.")

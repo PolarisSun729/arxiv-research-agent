@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 import pytest
 
+from services.arxiv import oai_incremental_sync
 from services.arxiv.oai_incremental_sync import (
     IncrementalSyncOptions,
     exclusive_sync_lock,
@@ -84,6 +85,25 @@ def test_syncs_each_day_after_cursor_and_advances_cursor(tmp_path: Path) -> None
     assert meta["last_successful_until"] == "2026-09-13"
     assert meta["days_completed"] == 3
     assert meta["records_written"] == 3
+
+
+def test_default_until_uses_utc_date_not_server_local_date(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 北京时间 11-04 03:40 = UTC 11-03 19:40：UTC 的 11-03 还没结束，只能同步到 11-02。
+    instant = datetime(2026, 11, 3, 19, 40, tzinfo=timezone.utc)
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            return instant.astimezone(tz) if tz else instant.astimezone(timezone(timedelta(hours=8))).replace(tzinfo=None)
+
+    monkeypatch.setattr(oai_incremental_sync, "datetime", FrozenDatetime)
+    (tmp_path / "sync.state").write_text("2026-11-01\n", encoding="utf-8")
+    sync_day = FakeDaySync()
+
+    assert run_incremental_sync(_options(tmp_path), sync_day=sync_day, latest_datestamp=lambda: None) == 0
+
+    assert sync_day.calls == ["2026-11-02"]
+    assert _state(tmp_path) == "2026-11-02"
 
 
 def test_failed_day_stops_run_and_keeps_cursor_at_last_success(tmp_path: Path) -> None:

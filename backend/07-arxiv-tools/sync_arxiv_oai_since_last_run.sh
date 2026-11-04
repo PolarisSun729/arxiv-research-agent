@@ -6,7 +6,8 @@
 #   手动执行：sudo systemctl start arxiv-oai-sync.service，日志：journalctl -u arxiv-oai-sync
 #
 # 工作流程（日期计算、游标读写和断点续传都在 sync_arxiv_oai.py 里完成）:
-#   1. 从游标的下一天同步到昨天，只同步已经完整结束的日子，不碰今天；
+#   1. 从游标的下一天同步到昨天（按 UTC 计日，与 OAI datestamp 一致，不受服务器时区影响），
+#      只同步已经完整结束的日子，不碰今天；
 #   2. 按天逐个同步，每天完成后立即推进游标；中断或某天失败时游标停在最后一个成功日，
 #      下次运行从失败的那天继续；中间停了几天也会在下次运行时一次补齐；
 #   3. 游标缺失时以 OAI 库中最大 datestamp 那天为起点；没有记录的日期（noRecordsMatch）按成功处理；
